@@ -1,4 +1,4 @@
-export type Phase = 'all' | 'learning' | 'exploration' | string;
+export type Phase = 'learning' | 'exploration' | string;
 
 export interface SessionRow {
   session_id: number;
@@ -31,7 +31,45 @@ export interface TrackingPoint {
   x_plot: number | null;
   y_plot: number | null;
   z_plot: number | null;
+  ax?: number | null;
+  ay?: number | null;
+  az?: number | null;
+  accel_norm?: number | null;
+  yaw_deg?: number | null;
   t_s: number;
+}
+
+export interface ImuTagStat {
+  tag_id: string;
+  samples: number;
+  median_accel: number | null;
+  p95_accel: number | null;
+  max_accel: number | null;
+  spike_count: number;
+  threshold?: number;
+  is_target: boolean;
+}
+
+export interface ImuImpactEvent {
+  tag_id: string;
+  t_s: number | null;
+  end_t_s: number | null;
+  peak_accel: number;
+}
+
+export interface ImuQuality {
+  tags: ImuTagStat[];
+  impacts: Array<{ tag_id: string; t_s: number | null; accel_norm: number }>;
+  events: ImuImpactEvent[];
+  impact_count: number;
+}
+
+export interface OrientationSummary {
+  samples_used: number;
+  median_offset_deg: number | null;
+  circular_std_deg: number | null;
+  consistency: 'good' | 'fair' | 'poor' | 'unknown';
+  note: string;
 }
 
 export interface FeedbackPoint {
@@ -108,6 +146,8 @@ export interface SessionPayload {
   closest: ClosestPoint[];
   speed: SpeedPoint[];
   profiles: Array<Record<string, any>>;
+  imu_quality?: ImuQuality;
+  orientation?: OrientationSummary;
 }
 
 export interface CompareRow extends MetricSummary {

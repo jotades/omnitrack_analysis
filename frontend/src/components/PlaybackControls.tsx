@@ -60,7 +60,7 @@ function PlaybackScrubber({
         aria-valuemin={0}
         aria-valuemax={safeDuration}
         aria-valuenow={safeTime}
-        aria-label="Timeline playback globale"
+        aria-label="Global playback timeline"
         onPointerDown={(event) => {
           if (disabled) return;
           setDragging(true);
@@ -115,12 +115,12 @@ export function PlaybackControls({
     <section className="card playbackPanel">
       <div className="playbackHeader">
         <div>
-          <strong>Playback globale</strong>
-          <p>La timeline sotto controlla tutti i grafici insieme. Trascina avanti o indietro senza resettare la sessione.</p>
+          <strong>Global playback</strong>
+          <p>The timeline below drives every chart together. You can also hover any chart or the trajectory to move the cursor back and forth — no Play needed.</p>
         </div>
         <label className="switchLabel">
           <input type="checkbox" checked={globalEnabled} onChange={(e) => onGlobalEnabled(e.target.checked)} />
-          Usa cursore globale
+          Use global cursor
         </label>
       </div>
 
@@ -136,7 +136,7 @@ export function PlaybackControls({
             disabled={!safeDuration || !globalEnabled}
           >
             {playing ? <Pause size={18} /> : <Play size={18} />}
-            {playing ? 'Pausa' : 'Play'}
+            {playing ? 'Pause' : 'Play'}
           </button>
 
           <button type="button" className="iconButton" onClick={() => { onTime(0); onPlaying(false); }} disabled={!safeDuration || !globalEnabled}>
@@ -146,7 +146,7 @@ export function PlaybackControls({
 
           <button type="button" className="iconButton" onClick={() => { onTime(safeDuration); onPlaying(false); }} disabled={!safeDuration || !globalEnabled}>
             <SkipForward size={18} />
-            Fine
+            End
           </button>
         </div>
 
@@ -159,7 +159,7 @@ export function PlaybackControls({
         />
 
         <label className="speedSelect">
-          Velocità
+          Speed
           <select value={speed} onChange={(e) => onSpeed(Number(e.target.value))} disabled={!globalEnabled}>
             <option value={0.25}>0.25×</option>
             <option value={0.5}>0.5×</option>

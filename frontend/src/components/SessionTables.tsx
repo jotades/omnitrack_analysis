@@ -7,8 +7,8 @@ export function SessionStatusTable({ sessions }: { sessions: SessionRow[] }) {
     <section className="card tableCard span2">
       <div className="cardHeader">
         <div>
-          <h2>Sessioni interrotte o sospette</h2>
-          <p>Flag calcolati da last_state, durata e numero campioni.</p>
+          <h2>Interrupted or suspicious sessions</h2>
+          <p>Flags computed from last_state, duration and sample count.</p>
         </div>
       </div>
       <div className="tableWrap compact">
@@ -34,8 +34,8 @@ export function ProfilesTable({ payload }: { payload: SessionPayload }) {
     <section className="card tableCard span2">
       <div className="cardHeader">
         <div>
-          <h2>Config feedback / proximity profiles</h2>
-          <p>Range intensità/frequenza collegati alla condition selezionata.</p>
+          <h2>Feedback config / proximity profiles</h2>
+          <p>Intensity/frequency ranges tied to the selected condition.</p>
         </div>
       </div>
       <div className="tableWrap compact">

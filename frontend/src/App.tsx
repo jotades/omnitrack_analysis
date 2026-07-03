@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshCw } from 'lucide-react';
-import { fetchCompareRows, fetchSessionDetail, fetchSessions, refreshIndex } from './api';
-import type { CompareRow, SessionPayload, SessionRow } from './types';
+import { GitCompareArrows, Moon, RefreshCw, Sun, User } from 'lucide-react';
+import { fetchSessionDetail, fetchSessions, refreshIndex } from './api';
+import type { SessionPayload, SessionRow } from './types';
 import { Controls } from './components/Controls';
 import { MetricCards } from './components/MetricCards';
+import { QualityIndicators } from './components/QualityIndicators';
 import { PlaybackControls } from './components/PlaybackControls';
 import { Trajectory2D } from './components/Trajectory2D';
 import {
@@ -16,6 +17,9 @@ import {
 import { ComparisonPanel } from './components/ComparisonPanel';
 import { ProfilesTable, SessionStatusTable } from './components/SessionTables';
 import './styles.css';
+
+export type AnalysisMode = 'single' | 'compare';
+type Theme = 'light' | 'dark';
 
 function firstOrEmpty(values: string[]) {
   return values.length ? values[0] : '';
@@ -47,29 +51,34 @@ function sortSessions(rows: SessionRow[]) {
   return [...rows].sort((a, b) => `${a.path_id}-${a.phase}-${a.start_time}`.localeCompare(`${b.path_id}-${b.phase}-${b.start_time}`));
 }
 
+function initialTheme(): Theme {
+  const stored = window.localStorage.getItem('omnitrack-theme');
+  if (stored === 'light' || stored === 'dark') return stored;
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
 export default function App() {
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [payload, setPayload] = useState<SessionPayload | null>(null);
-  const [compareRows, setCompareRows] = useState<CompareRow[]>([]);
   const [phaseOverlayPayloads, setPhaseOverlayPayloads] = useState<SessionPayload[]>([]);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
   const [phaseOverlayLoading, setPhaseOverlayLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('single');
+
   const [selectedPatient, setSelectedPatient] = useState('');
   const [selectedCondition, setSelectedCondition] = useState('');
-  const [selectedPhase, setSelectedPhase] = useState('all');
-  const [selectedPath, setSelectedPath] = useState('all');
+  const [selectedPhase, setSelectedPhase] = useState('learning');
+  const [selectedPath, setSelectedPath] = useState('');
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
 
   const [alpha, setAlpha] = useState(0.2);
   const [smoothTrajectory, setSmoothTrajectory] = useState(true);
   const [showCookedOverlay, setShowCookedOverlay] = useState(true);
   const [smoothOnlySeeker, setSmoothOnlySeeker] = useState(true);
-  const [compareMode, setCompareMode] = useState('single');
-  const [selectedComparePatients, setSelectedComparePatients] = useState<string[]>([]);
-  const [includeSuspicious, setIncludeSuspicious] = useState(true);
   const [showPhaseOverlay, setShowPhaseOverlay] = useState(false);
 
   const [globalPlayback, setGlobalPlayback] = useState(true);
@@ -77,6 +86,11 @@ export default function App() {
   const [playbackTime, setPlaybackTime] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const rafRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem('omnitrack-theme', theme);
+  }, [theme]);
 
   async function loadSessions() {
     setLoading(true);
@@ -90,7 +104,6 @@ export default function App() {
       const condition = selectedCondition || firstOrEmpty(conditions);
       setSelectedPatient(patient);
       setSelectedCondition(condition);
-      setSelectedComparePatients((old) => old.length ? old : patients.slice(0, Math.min(3, patients.length)));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -107,20 +120,33 @@ export default function App() {
     const validConditions = uniq(sessions.filter((s) => !selectedPatient || s.patient === selectedPatient).map((s) => s.condition));
     if (validConditions.length && !validConditions.includes(selectedCondition)) {
       setSelectedCondition(validConditions[0]);
-      setSelectedPath('all');
     }
   }, [sessions, selectedPatient, selectedCondition]);
 
+  // Phase has no "all" option: fall back to the first phase that actually has sessions.
   useEffect(() => {
-    const validPaths = ['all', ...uniq(
+    const validPhases = uniq(
       sessions
         .filter((s) => !selectedPatient || s.patient === selectedPatient)
         .filter((s) => !selectedCondition || s.condition === selectedCondition)
-        .filter((s) => selectedPhase === 'all' || s.phase === selectedPhase)
+        .map((s) => s.phase)
+    );
+    if (validPhases.length && !validPhases.includes(selectedPhase)) {
+      setSelectedPhase(validPhases.includes('learning') ? 'learning' : validPhases[0]);
+    }
+  }, [sessions, selectedPatient, selectedCondition, selectedPhase]);
+
+  // Path has no "all" option either: default to the first available path.
+  useEffect(() => {
+    const validPaths = uniq(
+      sessions
+        .filter((s) => !selectedPatient || s.patient === selectedPatient)
+        .filter((s) => !selectedCondition || s.condition === selectedCondition)
+        .filter((s) => s.phase === selectedPhase)
         .map((s) => s.path_id)
-    )];
-    if (!validPaths.includes(selectedPath)) {
-      setSelectedPath('all');
+    );
+    if (validPaths.length && !validPaths.includes(selectedPath)) {
+      setSelectedPath(validPaths[0]);
     }
   }, [sessions, selectedPatient, selectedCondition, selectedPhase, selectedPath]);
 
@@ -129,8 +155,8 @@ export default function App() {
       sessions
         .filter((s) => !selectedPatient || s.patient === selectedPatient)
         .filter((s) => !selectedCondition || s.condition === selectedCondition)
-        .filter((s) => selectedPhase === 'all' || s.phase === selectedPhase)
-        .filter((s) => selectedPath === 'all' || s.path_id === selectedPath)
+        .filter((s) => s.phase === selectedPhase)
+        .filter((s) => !selectedPath || s.path_id === selectedPath)
     );
   }, [sessions, selectedPatient, selectedCondition, selectedPhase, selectedPath]);
 
@@ -145,8 +171,8 @@ export default function App() {
   }, [filteredSessions, selectedSessionId]);
 
   useEffect(() => {
-    if (selectedSessionId === null) {
-      setPayload(null);
+    if (selectedSessionId === null || analysisMode !== 'single') {
+      if (selectedSessionId === null) setPayload(null);
       return;
     }
 
@@ -175,7 +201,7 @@ export default function App() {
 
     loadDetail();
     return () => controller.abort();
-  }, [selectedSessionId, alpha, smoothTrajectory, smoothOnlySeeker]);
+  }, [selectedSessionId, alpha, smoothTrajectory, smoothOnlySeeker, analysisMode]);
 
   const duration = useMemo(() => payloadDuration(payload), [payload]);
 
@@ -222,28 +248,6 @@ export default function App() {
     setPlaybackTime((prev) => Math.abs(prev - next) < 0.05 ? prev : Math.max(0, Math.min(duration, next)));
   }, [duration, globalPlayback]);
 
-  useEffect(() => {
-    async function loadCompare() {
-      if (compareMode === 'single') {
-        setCompareRows([]);
-        return;
-      }
-      try {
-        const rows = await fetchCompareRows({
-          patients: compareMode === 'users' ? selectedComparePatients : [selectedPatient],
-          condition: selectedCondition,
-          pathId: selectedPath,
-          phase: compareMode === 'phase' ? 'all' : selectedPhase,
-          includeSuspicious,
-        });
-        setCompareRows(rows);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    }
-    loadCompare();
-  }, [compareMode, selectedComparePatients, selectedPatient, selectedCondition, selectedPath, selectedPhase, includeSuspicious]);
-
   const currentSession = sessions.find((s) => s.session_id === selectedSessionId) ?? null;
 
   const phaseOverlaySessionIds = useMemo(() => {
@@ -269,7 +273,7 @@ export default function App() {
   }, [currentSession, sessions]);
 
   useEffect(() => {
-    if (!showPhaseOverlay || !phaseOverlaySessionIds.length) {
+    if (!showPhaseOverlay || !phaseOverlaySessionIds.length || analysisMode !== 'single') {
       setPhaseOverlayPayloads([]);
       return;
     }
@@ -297,7 +301,7 @@ export default function App() {
       });
 
     return () => controller.abort();
-  }, [alpha, phaseOverlaySessionIds, showPhaseOverlay, smoothOnlySeeker, smoothTrajectory]);
+  }, [alpha, phaseOverlaySessionIds, showPhaseOverlay, smoothOnlySeeker, smoothTrajectory, analysisMode]);
 
   async function handleRefresh() {
     setError(null);
@@ -312,7 +316,7 @@ export default function App() {
   if (loading) {
     return (
       <main className="appShell">
-        <div className="loading"><RefreshCw className="spin" /> Caricamento sessioni...</div>
+        <div className="loading"><RefreshCw className="spin" /> Loading sessions...</div>
       </main>
     );
   }
@@ -323,107 +327,149 @@ export default function App() {
     <main className="appShell">
       <header className="hero">
         <div>
-          <p className="eyebrow">Jota research dashboard</p>
+          <p className="eyebrow">Omnitrack research dashboard</p>
           <h1>Session analytics: trajectory, feedback, learning vs exploration</h1>
           <p>
-            Dashboard React/Recharts con playback temporale globale: il cursore riempie insieme traiettoria, distanze, feedback e velocità.
+            Interactive dashboard with a global time cursor: trajectory, distances, feedback and speed fill together as you scrub or play.
           </p>
         </div>
-        <div className="heroMeta">
-          <strong>{sessions.length}</strong>
-          <span>sessioni indicizzate</span>
+        <div className="heroSide">
+          <button
+            type="button"
+            className="themeToggle"
+            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+            aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
+            {theme === 'dark' ? 'Light' : 'Dark'}
+          </button>
+          <div className="heroMeta">
+            <strong>{sessions.length}</strong>
+            <span>indexed sessions</span>
+          </div>
         </div>
       </header>
 
       {error ? <div className="errorBox">{error}</div> : null}
 
-      <Controls
-        sessions={sessions}
-        selectedPatient={selectedPatient}
-        selectedCondition={selectedCondition}
-        selectedPhase={selectedPhase}
-        selectedPath={selectedPath}
-        selectedSessionId={selectedSessionId}
-        alpha={alpha}
-        smoothTrajectory={smoothTrajectory}
-        showCookedOverlay={showCookedOverlay}
-        smoothOnlySeeker={smoothOnlySeeker}
-        compareMode={compareMode}
-        selectedComparePatients={selectedComparePatients}
-        includeSuspicious={includeSuspicious}
-        showPhaseOverlay={showPhaseOverlay}
-        onPatient={(v) => { setSelectedPatient(v); setSelectedPath('all'); }}
-        onCondition={(v) => { setSelectedCondition(v); setSelectedPath('all'); }}
-        onPhase={setSelectedPhase}
-        onPath={setSelectedPath}
-        onSession={setSelectedSessionId}
-        onAlpha={setAlpha}
-        onSmoothTrajectory={setSmoothTrajectory}
-        onShowCookedOverlay={setShowCookedOverlay}
-        onSmoothOnlySeeker={setSmoothOnlySeeker}
-        onCompareMode={setCompareMode}
-        onComparePatients={setSelectedComparePatients}
-        onIncludeSuspicious={setIncludeSuspicious}
-        onShowPhaseOverlay={setShowPhaseOverlay}
-        onRefresh={handleRefresh}
-      />
+      <div className="modeSwitch" role="tablist" aria-label="Analysis mode">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={analysisMode === 'single'}
+          className={analysisMode === 'single' ? 'active' : ''}
+          onClick={() => setAnalysisMode('single')}
+        >
+          <User size={16} />
+          <span>
+            <strong>Single session analysis</strong>
+            <small>One patient, one session: trajectory, playback and detailed charts</small>
+          </span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={analysisMode === 'compare'}
+          className={analysisMode === 'compare' ? 'active' : ''}
+          onClick={() => setAnalysisMode('compare')}
+        >
+          <GitCompareArrows size={16} />
+          <span>
+            <strong>Comparison mode</strong>
+            <small>Aggregate metrics across phases or across patients</small>
+          </span>
+        </button>
+      </div>
 
-      {currentSession ? (
-        <section className="sessionBanner">
-          <div>
-            <strong>{currentSession.patient}</strong> / {currentSession.phase} / {currentSession.condition_label} / {currentSession.path_id}
-          </div>
-          <span>{currentSession.warning}</span>
-        </section>
-      ) : null}
-
-      {detailLoading ? <div className="loading inlineLoading"><RefreshCw className="spin" /> Aggiorno grafici...</div> : null}
-      {phaseOverlayLoading ? <div className="loading inlineLoading"><RefreshCw className="spin" /> Carico overlay learning/exploration...</div> : null}
-
-      {payload ? <MetricCards metrics={payload.metrics} /> : null}
-
-      {payload ? (
-        <PlaybackControls
-          duration={duration}
-          time={playbackTime}
-          playing={isPlaying}
-          speed={playbackSpeed}
-          globalEnabled={globalPlayback}
-          onTime={setPlaybackTime}
-          onPlaying={setIsPlaying}
-          onSpeed={setPlaybackSpeed}
-          onGlobalEnabled={setGlobalPlayback}
+      {analysisMode === 'single' ? (
+        <Controls
+          sessions={sessions}
+          mode={analysisMode}
+          selectedPatient={selectedPatient}
+          selectedCondition={selectedCondition}
+          selectedPhase={selectedPhase}
+          selectedPath={selectedPath}
+          selectedSessionId={selectedSessionId}
+          alpha={alpha}
+          smoothTrajectory={smoothTrajectory}
+          showCookedOverlay={showCookedOverlay}
+          smoothOnlySeeker={smoothOnlySeeker}
+          showPhaseOverlay={showPhaseOverlay}
+          onPatient={setSelectedPatient}
+          onCondition={setSelectedCondition}
+          onPhase={setSelectedPhase}
+          onPath={setSelectedPath}
+          onSession={setSelectedSessionId}
+          onAlpha={setAlpha}
+          onSmoothTrajectory={setSmoothTrajectory}
+          onShowCookedOverlay={setShowCookedOverlay}
+          onSmoothOnlySeeker={setSmoothOnlySeeker}
+          onShowPhaseOverlay={setShowPhaseOverlay}
+          onRefresh={handleRefresh}
         />
       ) : null}
 
-      <section className="dashboardGrid">
-        {compareMode !== 'single' ? <ComparisonPanel rows={compareRows} mode={compareMode} /> : null}
+      {analysisMode === 'compare' ? (
+        <ComparisonPanel sessions={sessions} />
+      ) : (
+        <>
+          {currentSession ? (
+            <section className="sessionBanner">
+              <div>
+                <strong>{currentSession.patient}</strong> / {currentSession.phase} / {currentSession.condition_label} / {currentSession.path_id}
+              </div>
+              <span>{currentSession.warning}</span>
+            </section>
+          ) : null}
 
-        {payload ? (
-          <>
-            <Trajectory2D
-              payload={payload}
-              showCookedOverlay={showCookedOverlay}
-              playbackTime={controlledTime}
+          {detailLoading ? <div className="loading inlineLoading"><RefreshCw className="spin" /> Updating charts...</div> : null}
+          {phaseOverlayLoading ? <div className="loading inlineLoading"><RefreshCw className="spin" /> Loading learning/exploration overlay...</div> : null}
+
+          {payload ? <QualityIndicators payload={payload} /> : null}
+          {payload ? <MetricCards metrics={payload.metrics} /> : null}
+
+          {payload ? (
+            <PlaybackControls
               duration={duration}
-              onCursorTime={handleCursorTime}
-              phaseOverlayPayloads={phaseOverlayPayloads}
-              showPhaseOverlay={showPhaseOverlay}
-              onShowPhaseOverlay={setShowPhaseOverlay}
+              time={playbackTime}
+              playing={isPlaying}
+              speed={playbackSpeed}
+              globalEnabled={globalPlayback}
+              onTime={setPlaybackTime}
+              onPlaying={setIsPlaying}
+              onSpeed={setPlaybackSpeed}
+              onGlobalEnabled={setGlobalPlayback}
             />
-            <DistanceChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
-            <ClosestAndFeedbackChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
-            <FeedbackIntensityChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
-            <IntensityDistanceChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
-            <SpeedChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
-            <ProfilesTable payload={payload} />
-          </>
-        ) : (
-          <section className="card span2"><div className="emptyState">Nessuna sessione selezionata.</div></section>
-        )}
+          ) : null}
 
-        <SessionStatusTable sessions={sessions} />
-      </section>
+          <section className="dashboardGrid">
+            {payload ? (
+              <>
+                <Trajectory2D
+                  payload={payload}
+                  showCookedOverlay={showCookedOverlay}
+                  playbackTime={controlledTime}
+                  duration={duration}
+                  onCursorTime={handleCursorTime}
+                  phaseOverlayPayloads={phaseOverlayPayloads}
+                  showPhaseOverlay={showPhaseOverlay}
+                  onShowPhaseOverlay={setShowPhaseOverlay}
+                />
+                <DistanceChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
+                <ClosestAndFeedbackChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
+                <FeedbackIntensityChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
+                <IntensityDistanceChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
+                <SpeedChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
+                <ProfilesTable payload={payload} />
+              </>
+            ) : (
+              <section className="card span2"><div className="emptyState">No session selected.</div></section>
+            )}
+
+            <SessionStatusTable sessions={sessions} />
+          </section>
+        </>
+      )}
     </main>
   );
 }

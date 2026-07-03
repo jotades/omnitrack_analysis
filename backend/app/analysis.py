@@ -58,6 +58,7 @@ def load_json_cached(path_str: str) -> Dict[str, Any]:
 def clear_caches() -> None:
     load_json_cached.cache_clear()
     build_sessions_index_cached.cache_clear()
+    load_session_metrics.cache_clear()
 
 
 def discover_json_files(base_dir: Path) -> List[Tuple[Path, Optional[str]]]:
@@ -374,6 +375,184 @@ def session_to_tracking_df(data: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
+def session_to_orientation_df(data: Dict[str, Any]) -> pd.DataFrame:
+    """Extract per-sample IMU quaternion yaw (heading) per tag.
+
+    quat_array convention in the recordings is [x, y, z, w] (unit norm).
+    Yaw is the rotation around the vertical axis, in degrees, in the same
+    x/y frame as the positions.
+    """
+    rows = []
+    raw_data = data.get("raw_data") or []
+    for sample_idx, rec in enumerate(raw_data):
+        ts = pd.to_datetime(rec.get("timestamp"), errors="coerce")
+        for tag in (rec.get("activity_data") or {}).get("tags_data") or []:
+            quat = list(tag.get("quat_array") or [])
+            if len(quat) != 4:
+                continue
+            x, y, z, w = (float(v) for v in quat)
+            norm = math.sqrt(x * x + y * y + z * z + w * w)
+            if norm < 0.5:  # all-zero quaternion → IMU not initialised
+                yaw = np.nan
+            else:
+                x, y, z, w = x / norm, y / norm, z / norm, w / norm
+                yaw = math.degrees(math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+            rows.append({"sample_idx": sample_idx, "timestamp": ts, "tag_id": tag.get("id"), "yaw_deg": yaw})
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        t0 = df["timestamp"].min()
+        df["t_s"] = (df["timestamp"] - t0).dt.total_seconds()
+    return df
+
+
+def _circular_mean_deg(angles_deg: np.ndarray) -> float:
+    rad = np.radians(angles_deg)
+    return float(np.degrees(np.arctan2(np.nanmean(np.sin(rad)), np.nanmean(np.cos(rad)))))
+
+
+def _circular_std_deg(angles_deg: np.ndarray) -> float:
+    rad = np.radians(angles_deg)
+    r = math.hypot(float(np.nanmean(np.sin(rad))), float(np.nanmean(np.cos(rad))))
+    r = min(1.0, max(1e-9, r))
+    return float(np.degrees(math.sqrt(-2.0 * math.log(r))))
+
+
+def compute_imu_quality(
+    tracking_df: pd.DataFrame,
+    seeker_id: str,
+    target_ids: List[str],
+) -> Dict[str, Any]:
+    """Flag probable physical impacts on the (stationary) target sensors.
+
+    Target tags O1–O3 sit still, so their accel norm hovers near a small
+    baseline; a sample far above baseline means the sensor was hit/kicked.
+    """
+    out: Dict[str, Any] = {"tags": [], "impacts": [], "impact_count": 0}
+    if tracking_df.empty or "accel_norm" not in tracking_df.columns:
+        return out
+
+    for tag_id, g in tracking_df.groupby("tag_id", dropna=True):
+        acc = pd.to_numeric(g["accel_norm"], errors="coerce").dropna()
+        acc = acc[acc > 0]  # zeros = IMU not streaming
+        if acc.empty:
+            out["tags"].append({
+                "tag_id": tag_id, "samples": 0, "median_accel": None,
+                "p95_accel": None, "max_accel": None, "spike_count": 0, "is_target": tag_id in target_ids,
+            })
+            continue
+        median = float(acc.median())
+        p95 = float(acc.quantile(0.95))
+        threshold = max(settings.impact_min_accel, median + settings.impact_delta_accel)
+        spikes = g.loc[acc[acc > threshold].index] if tag_id in target_ids else g.iloc[0:0]
+        out["tags"].append({
+            "tag_id": tag_id,
+            "samples": int(len(acc)),
+            "median_accel": round(median, 3),
+            "p95_accel": round(p95, 3),
+            "max_accel": round(float(acc.max()), 3),
+            "spike_count": int(len(spikes)),
+            "threshold": round(threshold, 3),
+            "is_target": tag_id in target_ids,
+        })
+        for _, r in spikes.iterrows():
+            out["impacts"].append({
+                "tag_id": tag_id,
+                "t_s": _jsonable(r.get("t_s")),
+                "accel_norm": round(float(r["accel_norm"]), 3),
+            })
+
+    out["impacts"].sort(key=lambda r: (r["t_s"] is None, r["t_s"]))
+
+    # Consecutive spike samples belong to one physical hit: merge samples closer
+    # than 1 s (per tag) into a single event, keeping the peak acceleration.
+    events: List[Dict[str, Any]] = []
+    for imp in out["impacts"]:
+        prev = next((e for e in reversed(events) if e["tag_id"] == imp["tag_id"]), None)
+        if prev is not None and imp["t_s"] is not None and prev["end_t_s"] is not None and imp["t_s"] - prev["end_t_s"] <= 1.0:
+            prev["end_t_s"] = imp["t_s"]
+            prev["peak_accel"] = max(prev["peak_accel"], imp["accel_norm"])
+        else:
+            events.append({
+                "tag_id": imp["tag_id"],
+                "t_s": imp["t_s"],
+                "end_t_s": imp["t_s"],
+                "peak_accel": imp["accel_norm"],
+            })
+    out["events"] = events
+    out["impact_count"] = len(events)
+    return out
+
+
+def compute_orientation_consistency(
+    tracking_df: pd.DataFrame,
+    orientation_df: pd.DataFrame,
+    seeker_id: str,
+) -> Dict[str, Any]:
+    """Compare IMU yaw with the walking direction derived from the 2D trajectory.
+
+    A roughly constant offset means the IMU simply isn't aligned with the
+    walking direction (mounting offset); a large spread means yaw and
+    trajectory disagree and the arrow overlay should not be trusted.
+    """
+    out: Dict[str, Any] = {
+        "samples_used": 0,
+        "median_offset_deg": None,
+        "circular_std_deg": None,
+        "consistency": "unknown",
+        "note": "Not enough valid IMU/trajectory data.",
+    }
+    if tracking_df.empty or orientation_df.empty:
+        return out
+
+    p1 = tracking_df[tracking_df["tag_id"] == seeker_id].sort_values("timestamp")
+    yaw = orientation_df[orientation_df["tag_id"] == seeker_id].sort_values("timestamp")
+    if p1.empty or yaw.empty:
+        return out
+
+    merged = p1[["timestamp", "t_s", "x", "y"]].merge(yaw[["timestamp", "yaw_deg"]], on="timestamp", how="inner")
+    if len(merged) < 10:
+        return out
+
+    # Smooth positions before differencing: raw UWB jitter would randomise headings.
+    win = 5
+    merged["xs"] = merged["x"].rolling(win, min_periods=1, center=True).median()
+    merged["ys"] = merged["y"].rolling(win, min_periods=1, center=True).median()
+    merged["dx"] = merged["xs"].diff(win)
+    merged["dy"] = merged["ys"].diff(win)
+    merged["dt"] = merged["t_s"].diff(win)
+    merged["step"] = np.hypot(merged["dx"], merged["dy"])
+    merged["speed"] = merged["step"] / merged["dt"]
+    moving = merged[(merged["speed"] > settings.heading_min_speed) & merged["yaw_deg"].notna()].copy()
+    if len(moving) < 10:
+        out["note"] = "Seeker rarely moved fast enough to estimate walking direction."
+        return out
+
+    moving["heading_deg"] = np.degrees(np.arctan2(moving["dy"], moving["dx"]))
+    diff = (moving["yaw_deg"] - moving["heading_deg"] + 180.0) % 360.0 - 180.0
+    offset = _circular_mean_deg(diff.to_numpy())
+    residual = (diff - offset + 180.0) % 360.0 - 180.0
+    spread = _circular_std_deg(residual.to_numpy())
+
+    if spread < 30:
+        consistency = "good"
+        note = "IMU yaw tracks the walking direction (constant mounting offset removed)."
+    elif spread < 60:
+        consistency = "fair"
+        note = "IMU yaw only loosely follows the walking direction; treat the arrow as indicative."
+    else:
+        consistency = "poor"
+        note = "IMU yaw does not match the trajectory; the sensor was probably not aligned with the walking direction."
+
+    out.update({
+        "samples_used": int(len(moving)),
+        "median_offset_deg": round(offset, 1),
+        "circular_std_deg": round(spread, 1),
+        "consistency": consistency,
+        "note": note,
+    })
+    return out
+
+
 def session_to_feedback_df(data: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     raw_data = data.get("raw_data") or []
@@ -537,7 +716,14 @@ def metric_summary(
     return metrics
 
 
+@lru_cache(maxsize=2048)
 def load_session_metrics(session_id: int) -> Dict[str, Any]:
+    """Metrics only depend on the raw file, so cache them: comparisons across
+    many patients would otherwise recompute every session on each request."""
+    return _load_session_metrics_uncached(session_id)
+
+
+def _load_session_metrics_uncached(session_id: int) -> Dict[str, Any]:
     sessions_df = get_sessions_df()
     if session_id < 0 or session_id >= len(sessions_df):
         raise IndexError(f"session_id non valido: {session_id}")
@@ -578,9 +764,12 @@ def load_session_payload(
 
     tracking_df = session_to_tracking_df(data)
     feedback_df = session_to_feedback_df(data)
+    orientation_df = session_to_orientation_df(data)
     dist_df = compute_distances(tracking_df, seeker_id=config["seeker_id"], target_ids=config["target_ids"])
     closest_df = compute_closest_target_df(dist_df)
     speed_df = compute_speed_df(tracking_df, seeker_id=config["seeker_id"], rolling_window=settings.speed_rolling_window)
+    imu_quality = compute_imu_quality(tracking_df, config["seeker_id"], config["target_ids"])
+    orientation = compute_orientation_consistency(tracking_df, orientation_df, config["seeker_id"])
 
     smooth_tag_ids = [config["seeker_id"]] if smooth_only_seeker else None
     tracking_plot_df = add_ewma_plot_columns(
@@ -588,6 +777,12 @@ def load_session_payload(
         alpha=alpha if smooth_trajectory else 1.0,
         tag_ids=smooth_tag_ids,
     )
+    if not orientation_df.empty:
+        tracking_plot_df = tracking_plot_df.merge(
+            orientation_df[["timestamp", "tag_id", "yaw_deg"]],
+            on=["timestamp", "tag_id"],
+            how="left",
+        )
     profile_df = config_to_profile_df(config)
     metrics = metric_summary(summary, feedback_df, closest_df, speed_df)
 
@@ -614,6 +809,8 @@ def load_session_payload(
         "closest": df_records(closest_df_out),
         "speed": df_records(speed_df_out),
         "profiles": df_records(profile_df),
+        "imu_quality": imu_quality,
+        "orientation": orientation,
     }
 
 
@@ -644,13 +841,13 @@ def compare_sessions(
             m = {"error": str(exc)}
         results.append({
             "session_id": int(r["session_id"]),
-            "patient": r["patient"],
-            "phase": r["phase"],
-            "condition": r["condition"],
-            "condition_label": r["condition_label"],
-            "path_id": r["path_id"],
-            "start_time": r["start_time"],
-            "warning": r["warning"],
-            **m,
+            "patient": _jsonable(r["patient"]),
+            "phase": _jsonable(r["phase"]),
+            "condition": _jsonable(r["condition"]),
+            "condition_label": _jsonable(r["condition_label"]),
+            "path_id": _jsonable(r["path_id"]),
+            "start_time": _jsonable(r["start_time"]),
+            "warning": _jsonable(r["warning"]),
+            **{k: _jsonable(v) for k, v in m.items()},
         })
     return results

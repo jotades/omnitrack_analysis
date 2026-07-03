@@ -6,7 +6,7 @@ interface Props {
   label?: string;
 }
 
-export function ChartScaleControls({ value, onChange, label = 'Scala Y' }: Props) {
+export function ChartScaleControls({ value, onChange, label = 'Y scale' }: Props) {
   return (
     <div className="chartTools">
       <label>
@@ -14,7 +14,7 @@ export function ChartScaleControls({ value, onChange, label = 'Scala Y' }: Props
         <select value={value} onChange={(e) => onChange(e.target.value as ScaleMode)}>
           <option value="tight">tight ±5%</option>
           <option value="auto">auto Recharts</option>
-          <option value="zero">da 0</option>
+          <option value="zero">from 0</option>
         </select>
       </label>
     </div>

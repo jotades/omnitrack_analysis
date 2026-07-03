@@ -17,6 +17,12 @@ class Settings(BaseModel):
     interrupt_state: int = 2
     completed_state: int = 1
     speed_rolling_window: int = 5
+    # IMU quality: a stationary target sensor whose accel norm jumps above
+    # max(impact_min_accel, median + impact_delta_accel) was probably hit/kicked.
+    impact_min_accel: float = 1.5
+    impact_delta_accel: float = 1.0
+    # Minimum speed (m/s) before the trajectory heading is considered meaningful.
+    heading_min_speed: float = 0.25
 
 
 @lru_cache(maxsize=1)

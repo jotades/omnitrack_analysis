@@ -32,8 +32,8 @@ export class ErrorBoundary extends React.Component<Props, State> {
           <section className="card span2">
             <div className="cardHeader">
               <div>
-                <h2>Errore nella dashboard</h2>
-                <p>La pagina non è più bianca: ora l'errore resta visibile.</p>
+                <h2>Dashboard error</h2>
+                <p>The page no longer goes blank: the error stays visible.</p>
               </div>
             </div>
             <div className="errorBox">
@@ -41,7 +41,7 @@ export class ErrorBoundary extends React.Component<Props, State> {
               {this.state.stack ? <pre className="errorStack">{this.state.stack}</pre> : null}
             </div>
             <button type="button" onClick={() => this.setState({ hasError: false, message: '', stack: undefined })}>
-              Riprendi
+              Resume
             </button>
           </section>
         </main>
