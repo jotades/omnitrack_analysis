@@ -1,4 +1,4 @@
-# Jota Interactive Dashboard
+#OmniAnalytics
 
 Dashboard responsive per analisi sessioni JSON `pp_*`, con backend Python/FastAPI e frontend React/Recharts.
 
