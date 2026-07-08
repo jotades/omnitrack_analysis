@@ -479,6 +479,78 @@ button:hover { opacity: 0.9; }
   line-height: 1.4;
 }
 
+.conditionGridCard { overflow: hidden; }
+.collapseHeader {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  padding: 16px 20px;
+  cursor: pointer;
+  text-align: left;
+}
+.collapseHeader:hover { background: var(--surface2); }
+.collapseChevron { transition: transform 160ms ease; color: var(--muted); flex: none; }
+.collapseChevron.open { transform: rotate(180deg); }
+.collapseTitle { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.collapseTitle strong { font-size: 1.02rem; letter-spacing: -0.02em; }
+.collapseTitle small { color: var(--muted); font-size: 0.82rem; }
+
+.conditionGridBody { padding: 0 16px 16px; }
+.miniTrajGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.miniTrajCard {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  background: var(--surface);
+}
+.miniTrajTitle { display: flex; flex-direction: column; gap: 1px; }
+.miniTrajTitle strong { font-size: 0.86rem; letter-spacing: -0.01em; }
+.miniTrajTitle span { color: var(--muted); font-size: 0.78rem; font-weight: 700; }
+.miniTrajSvg { width: 100%; height: auto; display: block; }
+.miniTrajStatus {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+.miniTrajPhase { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+.miniTrajPhase i { width: 10px; height: 3px; border-radius: 2px; flex: none; }
+.miniTrajPhase em { font-style: normal; opacity: 0.8; }
+.miniTrajPhase select { font-size: 0.75rem; min-height: 22px; padding: 0 4px; }
+.miniTrajEmpty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 24px 12px;
+  min-height: 140px;
+}
+
+@media (max-width: 1400px) {
+  .miniTrajGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .miniTrajGrid { grid-template-columns: 1fr; }
+}
+
 .tableCard { overflow: hidden; }
 .tableWrap { overflow: auto; padding: 14px 18px 18px; }
 .tableWrap.compact { max-height: 380px; }
@@ -608,27 +680,31 @@ td { color: var(--text); }
 }
 
 .playbackPanel {
-  padding: 18px;
-  margin: 18px 0 16px;
-  overflow: hidden;
-}
-
-.playbackHeader {
+  position: sticky;
+  top: 10px;
+  z-index: 30;
   display: flex;
-  justify-content: space-between;
-  gap: 18px;
-  align-items: flex-start;
-  margin-bottom: 14px;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 14px;
+  margin: 18px 0 16px;
+  background: color-mix(in srgb, var(--surface) 86%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 10px 28px rgba(16, 24, 40, 0.14);
 }
-.playbackHeader strong {
-  display: block;
-  font-size: 1.02rem;
+.playbackPanel .scrubber { flex: 1; }
+.playbackPanel .iconButton.compact {
+  width: 34px;
+  min-height: 34px;
+  padding: 0;
+  flex: none;
 }
-.playbackHeader p {
-  margin: 4px 0 0;
-  color: var(--muted);
-  font-size: 0.88rem;
+.speedSelectCompact {
+  min-height: 34px;
+  font-size: 0.82rem;
 }
+.playbackPanel .switchLabel { font-size: 0.82rem; color: var(--muted); }
 
 .switchLabel {
   display: inline-flex;
@@ -640,19 +716,11 @@ td { color: var(--text); }
   white-space: nowrap;
 }
 
-.playbackControlsRow {
-  display: grid;
-  grid-template-columns: auto minmax(220px, 1fr) 120px;
-  gap: 14px;
-  align-items: center;
-  width: 100%;
-  min-width: 0;
-}
 .playbackButtons {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
+  flex: none;
 }
 .iconButton {
   min-height: 38px;
@@ -668,20 +736,10 @@ td { color: var(--text); }
   cursor: pointer;
 }
 .iconButton:disabled,
-.speedSelect select:disabled,
+.speedSelectCompact:disabled,
 .scrubber.disabled {
   opacity: 0.45;
   cursor: not-allowed;
-}
-.speedSelect {
-  display: inline-flex;
-  gap: 8px;
-  align-items: center;
-  font-size: 0.9rem;
-  min-width: 0;
-}
-.speedSelect select {
-  min-height: 38px;
 }
 .scrubber {
   display: grid;
@@ -937,17 +995,14 @@ td { color: var(--text); }
 }
 
 @media (max-width: 1100px) {
-  .playbackHeader { flex-direction: column; }
-  .playbackControlsRow { grid-template-columns: 1fr; }
-  .speedSelect { max-width: 220px; }
   .compactTools { grid-template-columns: 1fr 1fr; }
 }
 
 @media (max-width: 720px) {
   .drawerToggle { right: 12px; top: 12px; }
-  .playbackButtons { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .playbackPanel { flex-wrap: wrap; gap: 8px; padding: 8px 10px; }
+  .playbackPanel .scrubber { flex: 1 1 100%; order: 3; }
   .iconButton { padding: 0 8px; }
-  .scrubber { grid-template-columns: 1fr; gap: 6px; }
   .scrubberTime, .scrubberTime.end { text-align: left; }
   .compactTools { grid-template-columns: 1fr; }
 }

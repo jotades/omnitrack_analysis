@@ -112,64 +112,59 @@ export function PlaybackControls({
   const safeTime = Math.min(safeDuration, Math.max(0, Number.isFinite(time) ? time : 0));
 
   return (
-    <section className="card playbackPanel">
-      <div className="playbackHeader">
-        <div>
-          <strong>Global playback</strong>
-          <p>The timeline below drives every chart together. You can also hover any chart or the trajectory to move the cursor back and forth — no Play needed.</p>
-        </div>
-        <label className="switchLabel">
-          <input type="checkbox" checked={globalEnabled} onChange={(e) => onGlobalEnabled(e.target.checked)} />
-          Use global cursor
-        </label>
-      </div>
-
-      <div className="playbackControlsRow">
-        <div className="playbackButtons">
-          <button
-            type="button"
-            className="iconButton"
-            onClick={() => {
-              if (safeTime >= safeDuration - 0.05) onTime(0);
-              onPlaying(!playing);
-            }}
-            disabled={!safeDuration || !globalEnabled}
-          >
-            {playing ? <Pause size={18} /> : <Play size={18} />}
-            {playing ? 'Pause' : 'Play'}
-          </button>
-
-          <button type="button" className="iconButton" onClick={() => { onTime(0); onPlaying(false); }} disabled={!safeDuration || !globalEnabled}>
-            <RotateCcw size={18} />
-            Reset
-          </button>
-
-          <button type="button" className="iconButton" onClick={() => { onTime(safeDuration); onPlaying(false); }} disabled={!safeDuration || !globalEnabled}>
-            <SkipForward size={18} />
-            End
-          </button>
-        </div>
-
-        <PlaybackScrubber
-          duration={safeDuration}
-          time={safeTime}
+    <section className="card playbackPanel" aria-label="Global playback">
+      <div className="playbackButtons">
+        <button
+          type="button"
+          className="iconButton compact"
+          title={playing ? 'Pause' : 'Play'}
+          aria-label={playing ? 'Pause' : 'Play'}
+          onClick={() => {
+            if (safeTime >= safeDuration - 0.05) onTime(0);
+            onPlaying(!playing);
+          }}
           disabled={!safeDuration || !globalEnabled}
-          onTime={onTime}
-          onPlaying={onPlaying}
-        />
+        >
+          {playing ? <Pause size={16} /> : <Play size={16} />}
+        </button>
 
-        <label className="speedSelect">
-          Speed
-          <select value={speed} onChange={(e) => onSpeed(Number(e.target.value))} disabled={!globalEnabled}>
-            <option value={0.25}>0.25×</option>
-            <option value={0.5}>0.5×</option>
-            <option value={1}>1×</option>
-            <option value={2}>2×</option>
-            <option value={4}>4×</option>
-            <option value={8}>8×</option>
-          </select>
-        </label>
+        <button type="button" className="iconButton compact" title="Reset" aria-label="Reset" onClick={() => { onTime(0); onPlaying(false); }} disabled={!safeDuration || !globalEnabled}>
+          <RotateCcw size={16} />
+        </button>
+
+        <button type="button" className="iconButton compact" title="Skip to end" aria-label="Skip to end" onClick={() => { onTime(safeDuration); onPlaying(false); }} disabled={!safeDuration || !globalEnabled}>
+          <SkipForward size={16} />
+        </button>
       </div>
+
+      <PlaybackScrubber
+        duration={safeDuration}
+        time={safeTime}
+        disabled={!safeDuration || !globalEnabled}
+        onTime={onTime}
+        onPlaying={onPlaying}
+      />
+
+      <select
+        className="speedSelectCompact"
+        title="Playback speed"
+        aria-label="Playback speed"
+        value={speed}
+        onChange={(e) => onSpeed(Number(e.target.value))}
+        disabled={!globalEnabled}
+      >
+        <option value={0.25}>0.25×</option>
+        <option value={0.5}>0.5×</option>
+        <option value={1}>1×</option>
+        <option value={2}>2×</option>
+        <option value={4}>4×</option>
+        <option value={8}>8×</option>
+      </select>
+
+      <label className="switchLabel" title="The global cursor drives every chart together; hovering any chart also moves it.">
+        <input type="checkbox" checked={globalEnabled} onChange={(e) => onGlobalEnabled(e.target.checked)} />
+        global
+      </label>
     </section>
   );
 }

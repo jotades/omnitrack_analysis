@@ -8,6 +8,7 @@ import { QualityIndicators } from './components/QualityIndicators';
 import { PlaybackControls } from './components/PlaybackControls';
 import { Trajectory2D } from './components/Trajectory2D';
 import { OrientationBox3D } from './components/OrientationBox3D';
+import { ConditionTrajectoriesGrid } from './components/ConditionTrajectoriesGrid';
 import {
   ClosestAndFeedbackChart,
   DistanceChart,
@@ -456,6 +457,13 @@ export default function App() {
                   phaseOverlayPayloads={phaseOverlayPayloads}
                   showPhaseOverlay={showPhaseOverlay}
                   onShowPhaseOverlay={setShowPhaseOverlay}
+                />
+                <ConditionTrajectoriesGrid
+                  sessions={sessions}
+                  patient={selectedPatient}
+                  alpha={alpha}
+                  smoothTrajectory={smoothTrajectory}
+                  smoothOnlySeeker={smoothOnlySeeker}
                 />
                 <OrientationBox3D payload={payload} playbackTime={controlledTime} duration={duration} />
                 <OrientationAnglesChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
