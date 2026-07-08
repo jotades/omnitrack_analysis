@@ -7,11 +7,13 @@ import { MetricCards } from './components/MetricCards';
 import { QualityIndicators } from './components/QualityIndicators';
 import { PlaybackControls } from './components/PlaybackControls';
 import { Trajectory2D } from './components/Trajectory2D';
+import { OrientationBox3D } from './components/OrientationBox3D';
 import {
   ClosestAndFeedbackChart,
   DistanceChart,
   FeedbackIntensityChart,
   IntensityDistanceChart,
+  OrientationAnglesChart,
   SpeedChart,
 } from './components/TimeSeriesCharts';
 import { ComparisonPanel } from './components/ComparisonPanel';
@@ -455,6 +457,8 @@ export default function App() {
                   showPhaseOverlay={showPhaseOverlay}
                   onShowPhaseOverlay={setShowPhaseOverlay}
                 />
+                <OrientationBox3D payload={payload} playbackTime={controlledTime} duration={duration} />
+                <OrientationAnglesChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
                 <DistanceChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
                 <ClosestAndFeedbackChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
                 <FeedbackIntensityChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />

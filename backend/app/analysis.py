@@ -393,11 +393,18 @@ def session_to_orientation_df(data: Dict[str, Any]) -> pd.DataFrame:
             x, y, z, w = (float(v) for v in quat)
             norm = math.sqrt(x * x + y * y + z * z + w * w)
             if norm < 0.5:  # all-zero quaternion → IMU not initialised
-                yaw = np.nan
+                yaw = roll = pitch = np.nan
+                x = y = z = w = np.nan
             else:
                 x, y, z, w = x / norm, y / norm, z / norm, w / norm
                 yaw = math.degrees(math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
-            rows.append({"sample_idx": sample_idx, "timestamp": ts, "tag_id": tag.get("id"), "yaw_deg": yaw})
+                roll = math.degrees(math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y)))
+                pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2.0 * (w * y - z * x)))))
+            rows.append({
+                "sample_idx": sample_idx, "timestamp": ts, "tag_id": tag.get("id"),
+                "yaw_deg": yaw, "roll_deg": roll, "pitch_deg": pitch,
+                "qx": x, "qy": y, "qz": z, "qw": w,
+            })
     df = pd.DataFrame(rows)
     if not df.empty:
         t0 = df["timestamp"].min()
@@ -779,7 +786,7 @@ def load_session_payload(
     )
     if not orientation_df.empty:
         tracking_plot_df = tracking_plot_df.merge(
-            orientation_df[["timestamp", "tag_id", "yaw_deg"]],
+            orientation_df[["timestamp", "tag_id", "yaw_deg", "roll_deg", "pitch_deg", "qx", "qy", "qz", "qw"]],
             on=["timestamp", "tag_id"],
             how="left",
         )

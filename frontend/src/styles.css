@@ -411,6 +411,74 @@ button:hover { opacity: 0.9; }
 .cardHeader p { margin: 4px 0 0; color: var(--muted); font-size: 0.88rem; }
 .chartBody { padding: 8px 12px 14px; }
 
+.chartOptionsRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.chartModeSwitch {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.chartModeSwitch button {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.chartModeSwitch button.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.chartInlineToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.orientationBoxControls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 4px 8px 6px;
+  font-size: 0.84rem;
+}
+.orientationBoxControls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.orientationReadout {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  font-weight: 600;
+}
+.orientationBoxSvg { display: block; user-select: none; }
+.orientationBoxSvg:active { cursor: grabbing; }
+.orientationBoxHint {
+  margin: 6px 8px 2px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
 .tableCard { overflow: hidden; }
 .tableWrap { overflow: auto; padding: 14px 18px 18px; }
 .tableWrap.compact { max-height: 380px; }

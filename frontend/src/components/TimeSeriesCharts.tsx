@@ -289,6 +289,105 @@ export function IntensityDistanceChart({ payload, playbackTime, duration }: Time
   );
 }
 
+const angleColors: Record<string, string> = {
+  roll_deg: '#d92d20', pitch_deg: '#17b26a', yaw_deg: '#3b5bfd',
+  qx: '#d92d20', qy: '#17b26a', qz: '#3b5bfd', qw: '#7a5af8',
+};
+
+function median(values: number[]): number | null {
+  if (!values.length) return null;
+  const s = [...values].sort((a, b) => a - b);
+  const mid = s.length >> 1;
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+type OrientationChartMode = 'angles' | 'quaternion';
+
+export function OrientationAnglesChart({ payload, playbackTime, duration, onCursorTime }: TimedChartProps) {
+  const [scaleMode, setScaleMode] = useState<ScaleMode>('tight');
+  const [mode, setMode] = useState<OrientationChartMode>('angles');
+  const [showYaw, setShowYaw] = useState(true);
+  const seekerId = payload.config.seeker_id;
+  const data = useMemo(
+    () => payload.tracking
+      .filter((p) => p.tag_id === seekerId && isFiniteNumber(p.t_s)
+        && (isFiniteNumber(p.roll_deg) || isFiniteNumber(p.pitch_deg) || isFiniteNumber(p.yaw_deg)))
+      .map((p) => ({
+        t_s: p.t_s,
+        roll_deg: p.roll_deg, pitch_deg: p.pitch_deg, yaw_deg: p.yaw_deg,
+        qx: p.qx, qy: p.qy, qz: p.qz, qw: p.qw,
+      }))
+      .sort((a, b) => a.t_s - b.t_s),
+    [payload.tracking, seekerId],
+  );
+  const d = duration ?? chartDuration(payload, data);
+  const t = clampTime(playbackTime, d);
+  const keys = mode === 'quaternion'
+    ? ['qx', 'qy', 'qz', 'qw']
+    : (showYaw ? ['roll_deg', 'pitch_deg', 'yaw_deg'] : ['roll_deg', 'pitch_deg']);
+  const chartData = useMemo(() => withPastSeries(data, keys, t), [data, keys, t]);
+  const yValues = data.flatMap((row) => keys.map((k) => row[k as keyof typeof row])).filter(isFiniteNumber);
+
+  const medRoll = median(data.map((r) => r.roll_deg).filter(isFiniteNumber));
+  const medPitch = median(data.map((r) => r.pitch_deg).filter(isFiniteNumber));
+  const names: Record<string, string> = {
+    roll_deg: 'roll (X)', pitch_deg: 'pitch (Y)', yaw_deg: 'yaw (Z)',
+    qx: 'qx', qy: 'qy', qz: 'qz', qw: 'qw',
+  };
+
+  return (
+    <ChartCard
+      title="IMU orientation over time"
+      subtitle="Roll/pitch near 0° and flat = device held level; a constant offset = held tilted at that angle; noisy lines = unstable grip. Yaw is the heading (it turns with the walk)."
+    >
+      {!data.length ? <EmptyChart message="No IMU orientation data for the seeker." /> : (
+        <>
+          <div className="chartOptionsRow">
+            <ChartScaleControls value={scaleMode} onChange={setScaleMode} />
+            <div className="chartModeSwitch" role="tablist" aria-label="Orientation representation">
+              <button type="button" className={mode === 'angles' ? 'active' : ''} onClick={() => setMode('angles')}>x, y, z angles</button>
+              <button type="button" className={mode === 'quaternion' ? 'active' : ''} onClick={() => setMode('quaternion')}>quaternion</button>
+            </div>
+            {mode === 'angles' ? (
+              <label className="chartInlineToggle">
+                <input type="checkbox" checked={showYaw} onChange={(e) => setShowYaw(e.target.checked)} />
+                show yaw
+              </label>
+            ) : null}
+          </div>
+          <ChartFrame height={300}>{(width, height) => (
+            <LineChart width={width} height={height} data={chartData} margin={chartMargin} onMouseMove={chartMouseMove(onCursorTime)}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="t_s" unit="s" type="number" domain={xDomain(d)} allowDataOverflow />
+              <YAxis domain={yDomain(yValues, scaleMode)} unit={mode === 'angles' ? '°' : undefined} />
+              <Tooltip {...tooltipProps} formatter={fmt} cursor={{ stroke: '#98a2b3', strokeWidth: 1 }} />
+              <ReferenceLine y={0} stroke="#98a2b3" strokeDasharray="4 4" />
+              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label="now" />
+              {keys.map((key) => (
+                <Line key={`${key}-ghost`} type="linear" dataKey={key} name={names[key]} dot={false} activeDot={{ r: 4 }}
+                  stroke={angleColors[key]} {...ghostStroke} isAnimationActive={false} />
+              ))}
+              {keys.map((key) => (
+                <Line key={key} type="linear" dataKey={`${key}__past`} dot={false} activeDot={false} tooltipType="none"
+                  stroke={angleColors[key]} strokeWidth={2} isAnimationActive={false} />
+              ))}
+            </LineChart>
+          )}</ChartFrame>
+          <div className="chartFooterRow">
+            <CustomLegend items={keys.map((key) => ({ name: names[key], color: angleColors[key] }))} />
+            {mode === 'angles' ? (
+              <span className="timeBadge">
+                median roll {medRoll !== null ? `${medRoll.toFixed(0)}°` : '—'} · median pitch {medPitch !== null ? `${medPitch.toFixed(0)}°` : '—'}
+              </span>
+            ) : null}
+            <TimeBadge time={t} duration={d} />
+          </div>
+        </>
+      )}
+    </ChartCard>
+  );
+}
+
 export function SpeedChart({ payload, playbackTime, duration, onCursorTime }: TimedChartProps) {
   const [scaleMode, setScaleMode] = useState<ScaleMode>('tight');
   const data = payload.speed.filter((p) => isFiniteNumber(p.t_s) && (isFiniteNumber(p.speed_m_s) || isFiniteNumber(p.speed_m_s_smooth)));

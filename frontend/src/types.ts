@@ -36,6 +36,12 @@ export interface TrackingPoint {
   az?: number | null;
   accel_norm?: number | null;
   yaw_deg?: number | null;
+  roll_deg?: number | null;
+  pitch_deg?: number | null;
+  qx?: number | null;
+  qy?: number | null;
+  qz?: number | null;
+  qw?: number | null;
   t_s: number;
 }
 
