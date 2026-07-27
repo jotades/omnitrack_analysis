@@ -8,8 +8,7 @@ import { QualityIndicators } from './components/QualityIndicators';
 import { PlaybackControls } from './components/PlaybackControls';
 import { Trajectory2D } from './components/Trajectory2D';
 import { OrientationBox3D } from './components/OrientationBox3D';
-import { TrialMiniStats } from './components/ConditionTrajectoriesGrid';
-import { ChartCard } from './components/ChartCard';
+import { SessionTrialMetricsCard } from './components/SessionTrialMetricsCard';
 import {
   ClosestAndFeedbackChart,
   DistanceChart,
@@ -267,15 +266,6 @@ export default function App() {
     return () => controller.abort();
   }, [selectedPatient, selectedCondition, selectedPath]);
 
-  const currentTrialRow = useMemo(() => {
-    if (!sessionTrialRows.length || !currentSession) return null;
-    if (currentSession.phase === 'exploration') {
-      return sessionTrialRows.find((r) => r.exploration_session_id === currentSession.session_id) ?? null;
-    }
-    // Learning is the shared reference across attempts: show the most recent attempt's trial metrics.
-    return sessionTrialRows[sessionTrialRows.length - 1] ?? null;
-  }, [sessionTrialRows, currentSession]);
-
   const phaseOverlaySessionIds = useMemo(() => {
     if (!currentSession) return [] as number[];
     const sameBlock = sortSessions(
@@ -433,7 +423,6 @@ export default function App() {
           smoothTrajectory={smoothTrajectory}
           showCookedOverlay={showCookedOverlay}
           smoothOnlySeeker={smoothOnlySeeker}
-          showPhaseOverlay={showPhaseOverlay}
           onPatient={setSelectedPatient}
           onCondition={setSelectedCondition}
           onPhase={setSelectedPhase}
@@ -443,7 +432,6 @@ export default function App() {
           onSmoothTrajectory={setSmoothTrajectory}
           onShowCookedOverlay={setShowCookedOverlay}
           onSmoothOnlySeeker={setSmoothOnlySeeker}
-          onShowPhaseOverlay={setShowPhaseOverlay}
           onRefresh={handleRefresh}
         />
       ) : null}
@@ -492,16 +480,15 @@ export default function App() {
                 duration={duration}
                 onCursorTime={handleCursorTime}
                 phaseOverlayPayloads={phaseOverlayPayloads}
-                showPhaseOverlay={showPhaseOverlay}
                 onShowPhaseOverlay={setShowPhaseOverlay}
               />
               <div className="statsStack">
-                <ChartCard
-                  title="Session & trial metrics"
-                  subtitle={currentSession ? `${currentSession.phase} · ${currentSession.path_id}` : undefined}
-                >
-                  <TrialMiniStats row={currentTrialRow} metrics={payload.metrics} />
-                </ChartCard>
+                <SessionTrialMetricsCard
+                  payload={payload}
+                  phaseOverlayPayloads={phaseOverlayPayloads}
+                  trialRows={sessionTrialRows}
+                  sessions={sessions}
+                />
                 <OrientationBox3D
                   payload={payload}
                   phaseOverlayPayloads={phaseOverlayPayloads}

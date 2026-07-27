@@ -1,7 +1,8 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import {
   CartesianGrid,
+  ReferenceArea,
   ReferenceDot,
   ReferenceLine,
   Scatter,
@@ -19,9 +20,14 @@ const phasePalette: Record<string, string> = {
   learning: '#3b5bfd',
   exploration: '#f79009',
 };
+const BORDER_COLOR = '#f79009';
+// Centered "safe" inner box used for the border_reached_count trial metric:
+// margin on the longer anchor-span axis, shorter margin on the other — mirrors
+// the backend's compute_border_events exactly (see analysis.py).
+const BORDER_MARGIN_LONG_M = 2.0;
+const BORDER_MARGIN_SHORT_M = 1.0;
 
 type RoomPreset = '8x12' | '12x8';
-type OverlayMode = 'off' | 'learningExploration';
 
 interface Trajectory2DProps {
   payload: SessionPayload;
@@ -30,7 +36,6 @@ interface Trajectory2DProps {
   duration?: number;
   onCursorTime?: (time: number) => void;
   phaseOverlayPayloads?: SessionPayload[];
-  showPhaseOverlay?: boolean;
   onShowPhaseOverlay?: (enabled: boolean) => void;
 }
 
@@ -180,7 +185,6 @@ export function Trajectory2D({
   duration,
   onCursorTime,
   phaseOverlayPayloads = [],
-  showPhaseOverlay = false,
   onShowPhaseOverlay,
 }: Trajectory2DProps) {
   const [roomPreset, setRoomPreset] = useState<RoomPreset>('8x12');
@@ -188,15 +192,53 @@ export function Trajectory2D({
   const [rotate90, setRotate90] = useState(true);
   const [showLabels, setShowLabels] = useState(true);
   const [showDirectionArrow, setShowDirectionArrow] = useState(true);
-  const [overlayMode, setOverlayMode] = useState<OverlayMode>(showPhaseOverlay ? 'learningExploration' : 'off');
+  const [showLearning, setShowLearning] = useState(true);
+  const [showExploration, setShowExploration] = useState(true);
+  const [showBorder, setShowBorder] = useState(false);
   const hoverAreaRef = useRef<HTMLDivElement | null>(null);
   const preHoverTimeRef = useRef<number | null>(null);
+
+  // Learning/exploration are on by default: ask the parent to preload both
+  // phase payloads as soon as this chart mounts, and again if the flags change.
+  useEffect(() => {
+    onShowPhaseOverlay?.(showLearning || showExploration);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showLearning, showExploration]);
 
   const { roomX, roomY } = roomDims(roomPreset);
   const displayDims = transformPoint(0, 0, roomX, roomY, rotate90);
   const displayRoomX = displayDims.displayRoomX;
   const displayRoomY = displayDims.displayRoomY;
   const roomAspect = displayRoomX / displayRoomY;
+
+  const borderBoxDisplay = useMemo(() => {
+    if (!showBorder) return null;
+    const anchors = payload.config.anchors ?? [];
+    const xs: number[] = [];
+    const ys: number[] = [];
+    for (const a of anchors) {
+      const coords = (a as { coords?: unknown[] })?.coords;
+      if (Array.isArray(coords) && isFiniteNumber(coords[0]) && isFiniteNumber(coords[1])) {
+        xs.push(coords[0] as number);
+        ys.push(coords[1] as number);
+      }
+    }
+    if (!xs.length || !ys.length) return null;
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys);
+    const [marginX, marginY] = (xMax - xMin) > (yMax - yMin)
+      ? [BORDER_MARGIN_LONG_M, BORDER_MARGIN_SHORT_M]
+      : [BORDER_MARGIN_SHORT_M, BORDER_MARGIN_LONG_M];
+    const corners = [
+      [xMin + marginX, yMin + marginY],
+      [xMax - marginX, yMin + marginY],
+      [xMax - marginX, yMax - marginY],
+      [xMin + marginX, yMax - marginY],
+    ].map(([x, y]) => transformPoint(x, y, roomX, roomY, rotate90));
+    const x2ds = corners.map((c) => c.x2d);
+    const y2ds = corners.map((c) => c.y2d);
+    return { x1: Math.min(...x2ds), x2: Math.max(...x2ds), y1: Math.min(...y2ds), y2: Math.max(...y2ds) };
+  }, [showBorder, payload.config.anchors, roomX, roomY, rotate90]);
   const computedDuration = duration ?? payload.metrics.duration_s ?? Math.max(0, ...payload.tracking.map((p) => p.t_s).filter(isFiniteNumber));
   const t = clampTime(playbackTime, computedDuration);
   const seeker = payload.config.seeker_id;
@@ -269,12 +311,12 @@ export function Trajectory2D({
     preHoverTimeRef.current = null;
   };
 
-  const overlayEnabled = overlayMode === 'learningExploration' && showPhaseOverlay;
   const phaseOverlays = useMemo(() => {
-    if (!overlayEnabled) return [];
     return phaseOverlayPayloads
       .map((phasePayload) => {
         const phase = String(phasePayload.summary?.phase ?? phasePayload.summary?.task ?? 'phase');
+        if (phase === 'learning' && !showLearning) return null;
+        if (phase === 'exploration' && !showExploration) return null;
         const phaseSeeker = phasePayload.config.seeker_id ?? seeker;
         const data = pointsForTag(phasePayload.tracking, phaseSeeker, t, true, roomX, roomY, rotate90).map((p) => ({ ...p, phase }));
         const endpoints = fullStartEnd(phasePayload.tracking, phaseSeeker, true, roomX, roomY, rotate90);
@@ -286,8 +328,8 @@ export function Trajectory2D({
         const arrowAngle = isCurrentSession ? null : headingFor(now, data.slice(-6), offset, rotate90);
         return { phase, data, endpoints, now, arrowAngle, color: phasePalette[phase] ?? '#344054' };
       })
-      .filter((item) => item.data.length);
-  }, [phaseOverlayPayloads, seeker, overlayEnabled, t, roomX, roomY, rotate90, payload.summary]);
+      .filter((item): item is NonNullable<typeof item> => item !== null && item.data.length > 0);
+  }, [phaseOverlayPayloads, seeker, showLearning, showExploration, t, roomX, roomY, rotate90, payload.summary]);
 
   const startEndDots = groupedPlot.flatMap(({ tag, data }) => {
     const start = data[0];
@@ -303,6 +345,7 @@ export function Trajectory2D({
     ...groupedPlot.map(({ tag }, idx) => ({ name: tag, color: palette[idx % palette.length] })),
     ...(cooked.length ? [{ name: `${seeker} cooked α=0.4`, color: '#777' }] : []),
     ...phaseOverlays.map((item) => ({ name: `${item.phase} ${seeker}`, color: item.color, dashed: true })),
+    ...(borderBoxDisplay ? [{ name: 'border 8×6 m', color: BORDER_COLOR, dashed: true }] : []),
   ];
 
   const pointsOutOfRoom = payload.tracking.filter((p) => {
@@ -326,19 +369,17 @@ export function Trajectory2D({
       ) : (
         <>
           <div className="chartTools trajectoryTools compactTools">
-            <label>
-              Trajectory overlay
-              <select
-                value={overlayMode}
-                onChange={(e) => {
-                  const next = e.target.value as OverlayMode;
-                  setOverlayMode(next);
-                  onShowPhaseOverlay?.(next === 'learningExploration');
-                }}
-              >
-                <option value="off">selected session</option>
-                <option value="learningExploration">learning + exploration, same patient/path</option>
-              </select>
+            <label className="inlineCheck">
+              <input type="checkbox" checked={showLearning} onChange={(e) => setShowLearning(e.target.checked)} />
+              Learning
+            </label>
+            <label className="inlineCheck">
+              <input type="checkbox" checked={showExploration} onChange={(e) => setShowExploration(e.target.checked)} />
+              Exploration
+            </label>
+            <label className="inlineCheck">
+              <input type="checkbox" checked={showBorder} onChange={(e) => setShowBorder(e.target.checked)} />
+              Border 8×6 m
             </label>
             <label>
               Room
@@ -347,12 +388,9 @@ export function Trajectory2D({
                 <option value="12x8">12 m × 8 m</option>
               </select>
             </label>
-            <label>
-              Orientation
-              <select value={rotate90 ? 'rotated' : 'original'} onChange={(e) => setRotate90(e.target.value === 'rotated')}>
-                <option value="rotated">rotated 90°</option>
-                <option value="original">original</option>
-              </select>
+            <label className="inlineCheck">
+              <input type="checkbox" checked={rotate90} onChange={(e) => setRotate90(e.target.checked)} />
+              Rotated 90°
             </label>
             <label className="inlineCheck">
               <input type="checkbox" checked={showAllTags} onChange={(e) => setShowAllTags(e.target.checked)} />
@@ -408,6 +446,16 @@ export function Trajectory2D({
                   <ReferenceLine x={displayRoomX} stroke="var(--ink)" strokeWidth={1.4} />
                   <ReferenceLine y={0} stroke="var(--ink)" strokeWidth={1.4} />
                   <ReferenceLine y={displayRoomY} stroke="var(--ink)" strokeWidth={1.4} />
+
+                  {borderBoxDisplay ? (
+                    <ReferenceArea
+                      x1={borderBoxDisplay.x1} x2={borderBoxDisplay.x2}
+                      y1={borderBoxDisplay.y1} y2={borderBoxDisplay.y2}
+                      stroke={BORDER_COLOR} strokeDasharray="6 4" strokeWidth={1.6}
+                      fill={BORDER_COLOR} fillOpacity={0.05}
+                      ifOverflow="visible"
+                    />
+                  ) : null}
 
                   {seekerFull.length ? (
                     <Scatter
@@ -520,8 +568,8 @@ export function Trajectory2D({
             )}
           </ChartFrame>
           <CustomLegend items={legendItems} />
-          {overlayMode === 'learningExploration' && !phaseOverlays.length ? (
-            <div className="miniWarning">Overlay requested: looking for learning/exploration sessions with the same patient, condition and path. If nothing shows up, one of the two sessions is missing or has no valid P1 points.</div>
+          {(showLearning || showExploration) && !phaseOverlays.length ? (
+            <div className="miniWarning">Looking for learning/exploration sessions with the same patient, condition and path. If nothing shows up, one of the two sessions is missing or has no valid P1 points.</div>
           ) : null}
         </>
       )}

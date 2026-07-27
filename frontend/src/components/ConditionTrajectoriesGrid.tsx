@@ -36,6 +36,9 @@ interface Props {
   smoothTrajectory: boolean;
   smoothOnlySeeker: boolean;
   trialRows: TrialRow[];
+  /** Skip the outer card + header — for embedding inside a per-patient
+   * collapsible section that already provides its own title. */
+  bare?: boolean;
 }
 
 interface CellPhase {
@@ -164,7 +167,7 @@ export function TrialMiniStats({ row, metrics }: { row: TrialRow | null; metrics
   );
 }
 
-export function ConditionTrajectoriesGrid({ sessions, patient, alpha, smoothTrajectory, smoothOnlySeeker, trialRows }: Props) {
+export function ConditionTrajectoriesGrid({ sessions, patient, alpha, smoothTrajectory, smoothOnlySeeker, trialRows, bare = false }: Props) {
   const [payloads, setPayloads] = useState<Map<number, SessionPayload>>(new Map());
   const [choices, setChoices] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(false);
@@ -262,19 +265,10 @@ export function ConditionTrajectoriesGrid({ sessions, patient, alpha, smoothTraj
 
   if (!cells.length) return null;
 
-  return (
-    <section className="card span2 conditionGridCard">
-      <div className="cardHeader">
-        <div>
-          <strong>Learning vs exploration — all trials ({patient})</strong>
-          <small>{cells.length} charts: one per condition × path, with the aggregated trial metrics for the selected attempt.</small>
-        </div>
-        {loading ? <RefreshCw size={15} className="spin" /> : null}
-      </div>
-
-      <div className="conditionGridBody">
-        {error ? <div className="errorBox">{error}</div> : null}
-        <div className="miniTrajGrid">
+  const gridBody = (
+    <div className="conditionGridBody">
+      {error ? <div className="errorBox">{error}</div> : null}
+      <div className="miniTrajGrid">
           {cells.map((cell) => {
             const phasePayloads = cell.phases
               .map((cp) => {
@@ -344,8 +338,22 @@ export function ConditionTrajectoriesGrid({ sessions, patient, alpha, smoothTraj
               </div>
             );
           })}
-        </div>
       </div>
+    </div>
+  );
+
+  if (bare) return gridBody;
+
+  return (
+    <section className="card span2 conditionGridCard">
+      <div className="cardHeader">
+        <div>
+          <strong>Learning vs exploration — all trials ({patient})</strong>
+          <small>{cells.length} charts: one per condition × path, with the aggregated trial metrics for the selected attempt.</small>
+        </div>
+        {loading ? <RefreshCw size={15} className="spin" /> : null}
+      </div>
+      {gridBody}
     </section>
   );
 }

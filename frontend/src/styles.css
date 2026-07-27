@@ -161,7 +161,7 @@ h1, h2, h3, strong { color: var(--ink); }
 /* === Analysis mode switcher === */
 .modeSwitch {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 16px;
 }
@@ -193,32 +193,34 @@ h1, h2, h3, strong { color: var(--ink); }
 .modeSwitch button.active strong { color: var(--accent); }
 
 /* === Quality indicators (IMU impacts + orientation) === */
+/* Compact notification pills, not tall boxes — full detail is in the title tooltip. */
 .qualityRow {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
   margin-bottom: 14px;
 }
 
-.qualityCard {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  padding: 14px 16px;
-  border-radius: 18px;
+.qualityPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 6px 14px;
+  border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--surface2);
+  font-size: 0.82rem;
+  font-weight: 700;
+  max-width: 100%;
+  cursor: default;
 }
-.qualityCard svg { flex-shrink: 0; margin-top: 2px; }
-.qualityCard strong { display: block; font-size: 0.92rem; }
-.qualityCard span { display: block; color: var(--muted); font-size: 0.84rem; margin-top: 2px; }
-.qualityCard.ok { background: var(--ok-bg); }
-.qualityCard.ok svg, .qualityCard.ok strong { color: var(--ok-fg); }
-.qualityCard.warn { background: var(--warn-bg); }
-.qualityCard.warn svg, .qualityCard.warn strong { color: var(--warn-fg); }
-.qualityCard.bad { background: var(--bad-bg); }
-.qualityCard.bad svg, .qualityCard.bad strong { color: var(--bad-fg); }
-.qualityCard.muted svg { color: var(--muted); }
+.qualityPill svg { flex-shrink: 0; }
+.qualityPill span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qualityPill.ok { background: var(--ok-bg); color: var(--ok-fg); }
+.qualityPill.warn { background: var(--warn-bg); color: var(--warn-fg); }
+.qualityPill.bad { background: var(--bad-bg); color: var(--bad-fg); }
+.qualityPill.muted { color: var(--muted); }
 
 /* === Comparison mode === */
 .comparisonControls { margin-bottom: 16px; }
@@ -482,6 +484,7 @@ button:hover { opacity: 0.9; }
 }
 
 .phaseToggle { display: inline-flex; gap: 6px; margin-bottom: 10px; }
+.orientationBoxControls .phaseToggle { margin-bottom: 0; }
 .phaseToggleBtn {
   min-height: 28px;
   padding: 0 12px;
@@ -527,8 +530,24 @@ button:hover { opacity: 0.9; }
   font-size: 0.8rem;
   line-height: 1.4;
 }
+.infoToggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  flex: none;
+}
+.infoToggle[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); background: var(--time-badge-bg); }
 
 .conditionGridCard { overflow: hidden; }
+.patientTrialList { display: flex; flex-direction: column; gap: 16px; margin-bottom: 16px; }
 .collapseHeader {
   display: flex;
   align-items: center;
@@ -635,7 +654,6 @@ td { color: var(--text); }
 @media (max-width: 1180px) {
   .controlGrid { grid-template-columns: repeat(2, minmax(160px, 1fr)); }
   .metricGrid { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
-  .qualityRow { grid-template-columns: 1fr; }
   .comparisonFilterGrid { grid-template-columns: repeat(2, minmax(160px, 1fr)); }
 }
 

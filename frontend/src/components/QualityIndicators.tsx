@@ -6,11 +6,13 @@ function fmtSeconds(t: number | null) {
 }
 
 /**
- * Data-quality banner shown above the metric cards:
+ * Compact data-quality notification pills shown above the metric cards:
  * - IMU impacts: a stationary target sensor (O1–O3) with an acceleration spike
  *   was probably hit or kicked during the session.
  * - Orientation consistency: how well the IMU yaw matches the walking
  *   direction derived from the 2D trajectory.
+ * Full detail is in the title tooltip rather than always-visible wrapped text,
+ * so this stays a thin strip instead of a tall two-box banner.
  */
 export function QualityIndicators({ payload }: { payload: SessionPayload }) {
   const imu = payload.imu_quality;
@@ -22,36 +24,30 @@ export function QualityIndicators({ payload }: { payload: SessionPayload }) {
   const impactSummary = events
     .map((e) => `${e.tag_id} at ${fmtSeconds(e.t_s)} (peak ${e.peak_accel.toFixed(1)})`)
     .join(', ');
+  const impactTitle = hasImpacts
+    ? `Sudden acceleration on stationary target sensors — likely hit or kicked: ${impactSummary}.`
+    : 'Acceleration on target sensors O1–O3 stayed near baseline for the whole session.';
 
   const consistency = orientation?.consistency ?? 'unknown';
   const orientationTone = consistency === 'good' ? 'ok' : consistency === 'fair' ? 'warn' : consistency === 'poor' ? 'bad' : 'muted';
   const offset = orientation?.median_offset_deg;
   const spread = orientation?.circular_std_deg;
+  const orientationTitle = orientation?.note ?? 'No orientation data available.';
 
   return (
     <div className="qualityRow">
-      <div className={`qualityCard ${hasImpacts ? 'bad' : 'ok'}`}>
-        {hasImpacts ? <AlertTriangle size={18} /> : <ShieldCheck size={18} />}
-        <div>
-          <strong>{hasImpacts ? `${events.length} sensor impact${events.length > 1 ? 's' : ''} detected` : 'No sensor impacts'}</strong>
-          <span>
-            {hasImpacts
-              ? `Sudden acceleration on stationary target sensors — likely hit or kicked: ${impactSummary}.`
-              : 'Acceleration on target sensors O1–O3 stayed near baseline for the whole session.'}
-          </span>
-        </div>
+      <div className={`qualityPill ${hasImpacts ? 'bad' : 'ok'}`} title={impactTitle}>
+        {hasImpacts ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
+        <span>{hasImpacts ? `${events.length} sensor impact${events.length > 1 ? 's' : ''} detected` : 'No sensor impacts'}</span>
       </div>
 
-      <div className={`qualityCard ${orientationTone}`}>
-        <Compass size={18} />
-        <div>
-          <strong>
-            IMU orientation vs trajectory: {consistency}
-            {typeof offset === 'number' ? ` · mounting offset ${offset.toFixed(0)}°` : ''}
-            {typeof spread === 'number' ? ` · spread ±${spread.toFixed(0)}°` : ''}
-          </strong>
-          <span>{orientation?.note ?? 'No orientation data available.'}</span>
-        </div>
+      <div className={`qualityPill ${orientationTone}`} title={orientationTitle}>
+        <Compass size={15} />
+        <span>
+          IMU orientation: {consistency}
+          {typeof offset === 'number' ? ` · offset ${offset.toFixed(0)}°` : ''}
+          {typeof spread === 'number' ? ` · ±${spread.toFixed(0)}°` : ''}
+        </span>
       </div>
     </div>
   );

@@ -14,7 +14,6 @@ interface Props {
   smoothTrajectory: boolean;
   showCookedOverlay: boolean;
   smoothOnlySeeker: boolean;
-  showPhaseOverlay: boolean;
   onPatient: (value: string) => void;
   onCondition: (value: string) => void;
   onPhase: (value: string) => void;
@@ -24,7 +23,6 @@ interface Props {
   onSmoothTrajectory: (value: boolean) => void;
   onShowCookedOverlay: (value: boolean) => void;
   onSmoothOnlySeeker: (value: boolean) => void;
-  onShowPhaseOverlay: (value: boolean) => void;
   onRefresh: () => void;
 }
 
@@ -149,7 +147,6 @@ export function Controls(props: Props) {
               <label><input type="checkbox" checked={props.smoothTrajectory} onChange={(e) => props.onSmoothTrajectory(e.target.checked)} /> Smooth 2D offline</label>
               <label><input type="checkbox" checked={props.showCookedOverlay} onChange={(e) => props.onShowCookedOverlay(e.target.checked)} /> Cooked overlay α=0.4</label>
               <label><input type="checkbox" checked={props.smoothOnlySeeker} onChange={(e) => props.onSmoothOnlySeeker(e.target.checked)} /> Smooth seeker P1 only</label>
-              <label><input type="checkbox" checked={props.showPhaseOverlay} onChange={(e) => props.onShowPhaseOverlay(e.target.checked)} /> Preload 2D learning/exploration overlay</label>
               <button type="button" onClick={props.onRefresh}>Refresh index</button>
             </div>
           ) : (

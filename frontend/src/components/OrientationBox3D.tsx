@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Info } from 'lucide-react';
 import type { SessionPayload, TrackingPoint } from '../types';
 import { ChartCard } from './ChartCard';
+import { type Phase, PhaseToggle, phaseOf, payloadForPhase } from './PhaseToggle';
 
 /**
  * 3D box driven by the raw IMU quaternion of the seeker tag, so you can see
@@ -18,8 +20,9 @@ import { ChartCard } from './ChartCard';
 interface Props {
   payload: SessionPayload;
   /** Learning/exploration payloads for the same patient/condition/path, when
-   * preloaded (App.tsx's "Preload learning/exploration overlay" toggle) — lets
-   * this card show either phase, not just whichever session is selected. */
+   * preloaded (the "Learning"/"Exploration" flags on the 2D room trajectory
+   * chart) — lets this card show either phase, not just whichever session is
+   * currently selected. */
   phaseOverlayPayloads?: SessionPayload[];
   playbackTime?: number | null;
   duration?: number;
@@ -30,11 +33,6 @@ type Vec3 = [number, number, number];
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
-}
-
-function phaseOf(payload: SessionPayload): 'learning' | 'exploration' | null {
-  const phase = payload.summary?.phase ?? payload.summary?.task;
-  return phase === 'learning' || phase === 'exploration' ? phase : null;
 }
 
 function quatOf(p: TrackingPoint): Quat | null {
@@ -174,22 +172,27 @@ const COMPASS_RADIUS = 1.28;
 
 export function OrientationBox3D({ payload, phaseOverlayPayloads = [], playbackTime, duration = 0 }: Props) {
   const [walkingFrame, setWalkingFrame] = useState(false);
+  const [showHint, setShowHint] = useState(false);
   const [view, setView] = useState({ azimuth: -32, elevation: 22 });
   const [localTime, setLocalTime] = useState<number | null>(null);
   const dragRef = useRef<{ x: number; y: number; azimuth: number; elevation: number } | null>(null);
 
   const currentPhase = phaseOf(payload);
-  const payloadForPhase = (phase: 'learning' | 'exploration'): SessionPayload | null => {
-    if (currentPhase === phase) return payload;
-    return phaseOverlayPayloads.find((p) => phaseOf(p) === phase) ?? null;
+  const availability = {
+    learning: !!payloadForPhase('learning', payload, phaseOverlayPayloads),
+    exploration: !!payloadForPhase('exploration', payload, phaseOverlayPayloads),
   };
+  // Prefer exploration by default (once loaded) — that's the phase this card
+  // is usually asked about. Recomputed live, so it switches over the moment
+  // the exploration payload finishes loading, without fighting a manual pick.
+  const preferredPhase: Phase | null = availability.exploration ? 'exploration' : availability.learning ? 'learning' : currentPhase;
 
-  // Default to whichever session is actually selected; switch back whenever
-  // the user picks a different session elsewhere.
-  const [selectedPhase, setSelectedPhase] = useState<'learning' | 'exploration' | null>(currentPhase);
-  useEffect(() => { setSelectedPhase(currentPhase); }, [payload.summary?.file, currentPhase]);
+  // A manual click sticks until a different session is selected elsewhere.
+  const [manualPhase, setManualPhase] = useState<Phase | null>(null);
+  useEffect(() => { setManualPhase(null); }, [payload.summary?.file]);
 
-  const effectivePayload = (selectedPhase && payloadForPhase(selectedPhase)) ?? payload;
+  const selectedPhase = manualPhase ?? preferredPhase;
+  const effectivePayload = (selectedPhase && payloadForPhase(selectedPhase, payload, phaseOverlayPayloads)) ?? payload;
   const effectivePhase = phaseOf(effectivePayload);
 
   const seekerId = effectivePayload.config.seeker_id;
@@ -349,23 +352,7 @@ export function OrientationBox3D({ payload, phaseOverlayPayloads = [], playbackT
     };
   }, [quat, walkingFrame, heading, view, trails]);
 
-  const availability = { learning: !!payloadForPhase('learning'), exploration: !!payloadForPhase('exploration') };
-  const phaseToggle = (
-    <div className="phaseToggle" role="group" aria-label="Show learning or exploration orientation">
-      {(['learning', 'exploration'] as const).map((phase) => (
-        <button
-          key={phase}
-          type="button"
-          className={`phaseToggleBtn ${effectivePhase === phase ? 'active' : ''}`}
-          disabled={!availability[phase]}
-          title={availability[phase] ? `Show ${phase}` : 'Enable "Preload 2D learning/exploration overlay" in Filters & settings to load this phase'}
-          onClick={() => setSelectedPhase(phase)}
-        >
-          {phase}
-        </button>
-      ))}
-    </div>
-  );
+  const phaseToggle = <PhaseToggle selected={effectivePhase} available={availability} onSelect={setManualPhase} />;
 
   if (!samples.length) {
     return (
@@ -377,22 +364,41 @@ export function OrientationBox3D({ payload, phaseOverlayPayloads = [], playbackT
   }
 
   return (
-    <ChartCard
-      title="3D sensor orientation"
-      subtitle={`Showing ${effectivePhase ?? 'the selected'} session — seeker ${seekerId} device (60×40×45 mm) at the playback cursor. Compass N = walking direction. Drag to orbit.`}
-    >
-      {phaseToggle}
+    <ChartCard title="3D sensor orientation" subtitle={`Showing ${effectivePhase ?? 'the selected'} session.`}>
       <div className="orientationBoxControls">
-        <label>
+        {phaseToggle}
+        <label className="inlineCheck">
           <input type="checkbox" checked={walkingFrame} onChange={(e) => setWalkingFrame(e.target.checked)} />
           Walking-direction frame (compass fixed)
         </label>
+      </div>
+      <div className="orientationBoxControls">
         {euler ? (
           <span className="orientationReadout">
             roll {fmtDeg(euler.roll)} · pitch {fmtDeg(euler.pitch)} · yaw {fmtDeg(euler.yaw)} · t = {time.toFixed(1)} s
           </span>
         ) : null}
+        <button
+          type="button"
+          className="infoToggle"
+          aria-expanded={showHint}
+          aria-label="What am I looking at?"
+          title="What am I looking at?"
+          onClick={() => setShowHint((v) => !v)}
+        >
+          <Info size={14} />
+        </button>
       </div>
+      {showHint ? (
+        <p className="orientationBoxHint">
+          Seeker {seekerId} device (60×40×45 mm) at the playback cursor. Compass N = walking direction, drag to
+          orbit. The static sphere is the gimbal: red dots are where the forward axis (X) pointed, blue dots where the
+          top axis (Z) pointed, accumulated up to the cursor. Blue dots clustered at "up" = device held level on
+          the 2D plane; a cluster away from the pole = held tilted at that angle; scattered dots = unstable grip.
+          N on the ground compass is the walking direction; enable the walking-direction frame to keep it fixed
+          and judge the grip independently of where the person was going.
+        </p>
+      ) : null}
       <svg
         viewBox={`0 0 ${W} ${H}`}
         className="orientationBoxSvg"
@@ -502,13 +508,6 @@ export function OrientationBox3D({ payload, phaseOverlayPayloads = [], playbackT
           />
         </div>
       ) : null}
-      <p className="orientationBoxHint">
-        The static sphere is the gimbal: red dots are where the forward axis (X) pointed, blue dots where the
-        top axis (Z) pointed, accumulated up to the cursor. Blue dots clustered at "up" = device held level on
-        the 2D plane; a cluster away from the pole = held tilted at that angle; scattered dots = unstable grip.
-        N on the ground compass is the walking direction; enable the walking-direction frame to keep it fixed
-        and judge the grip independently of where the person was going.
-      </p>
     </ChartCard>
   );
 }

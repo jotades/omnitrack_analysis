@@ -58,41 +58,70 @@ function CustomLegend({ items }: { items: Array<{ name: string; color: string }>
   );
 }
 
-export function TrialsPanel({ sessions }: Props) {
-  // ---------------------------------------------------------------------
-  // Trial overview: pick one patient, see every condition × path they ran
-  // (learning-vs-exploration mini charts + the aggregated trial metrics for
-  // each) at once. No condition/path filter here — every trial is shown, so
-  // filtering would just hide things; each mini chart has its own dropdown
-  // to pick which recorded attempt to display when there's more than one.
-  // ---------------------------------------------------------------------
-  const patients = useMemo(() => uniq(sessions.map((s) => s.patient)), [sessions]);
-  const [selectedPatient, setSelectedPatient] = useState('');
-
-  const conditionLabel = (c: string) => sessions.find((s) => s.condition === c)?.condition_label ?? c;
+/** One collapsible "dropdown" per patient — named after the patient, opens to
+ * reveal their learning-vs-exploration grid. Data is fetched lazily, only
+ * once a patient's section is actually opened. */
+function PatientTrialSection({ patient, sessions }: { patient: string; sessions: SessionRow[] }) {
+  const [open, setOpen] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [trialRows, setTrialRows] = useState<TrialRow[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!selectedPatient && patients.length) setSelectedPatient(patients[0]);
-  }, [patients, selectedPatient]);
-
-  const [patientTrialRows, setPatientTrialRows] = useState<TrialRow[]>([]);
-  const [patientTrialRowsLoading, setPatientTrialRowsLoading] = useState(false);
-  const [patientTrialRowsError, setPatientTrialRowsError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!selectedPatient) { setPatientTrialRows([]); return; }
+    if (!open || loaded) return;
     const controller = new AbortController();
-    setPatientTrialRowsLoading(true);
-    setPatientTrialRowsError(null);
-    fetchTrialRows({ patients: [selectedPatient], includeSuspicious: true, signal: controller.signal })
-      .then((result) => setPatientTrialRows(result))
+    setLoading(true);
+    setError(null);
+    fetchTrialRows({ patients: [patient], includeSuspicious: true, signal: controller.signal })
+      .then((result) => { setTrialRows(result); setLoaded(true); })
       .catch((e) => {
         if (e instanceof DOMException && e.name === 'AbortError') return;
-        setPatientTrialRowsError(e instanceof Error ? e.message : String(e));
+        setError(e instanceof Error ? e.message : String(e));
       })
-      .finally(() => { if (!controller.signal.aborted) setPatientTrialRowsLoading(false); });
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [selectedPatient]);
+  }, [open, loaded, patient]);
+
+  return (
+    <section className="card">
+      <button type="button" className="collapseHeader" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <ChevronDown size={18} className={`collapseChevron ${open ? 'open' : ''}`} />
+        <span className="collapseTitle">
+          <strong>{patient}</strong>
+          <small>Learning vs exploration — every condition × path this patient ran</small>
+        </span>
+        {loading ? <RefreshCw size={15} className="spin" /> : null}
+      </button>
+
+      {open ? (
+        <div className="conditionGridBody">
+          {error ? <div className="errorBox">{error}</div> : null}
+          <ConditionTrajectoriesGrid
+            sessions={sessions}
+            patient={patient}
+            alpha={0.2}
+            smoothTrajectory
+            smoothOnlySeeker
+            trialRows={trialRows}
+            bare
+          />
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+export function TrialsPanel({ sessions }: Props) {
+  // ---------------------------------------------------------------------
+  // Trial overview: one collapsible "dropdown" per patient, named after the
+  // patient. Opening it reveals every condition × path they ran (learning-vs-
+  // exploration mini charts + the aggregated trial metrics for each). Data
+  // for a patient loads lazily, only once their section is opened.
+  // ---------------------------------------------------------------------
+  const patients = useMemo(() => uniq(sessions.map((s) => s.patient)), [sessions]);
+
+  const conditionLabel = (c: string) => sessions.find((s) => s.condition === c)?.condition_label ?? c;
 
   // ---------------------------------------------------------------------
   // Cross-trial comparison (many patients/trials at once) — collapsed by
@@ -192,33 +221,16 @@ export function TrialsPanel({ sessions }: Props) {
         <div className="cardHeader">
           <div>
             <h2>Trial overview: exploration vs. learning</h2>
-            <p>Pick a patient to see every condition × path they ran, each with the learning/exploration trajectory overlay and the aggregated trial metrics.</p>
+            <p>One dropdown per patient — open it to see every condition × path they ran, with the learning/exploration trajectory overlay and the aggregated trial metrics.</p>
           </div>
-          {patientTrialRowsLoading ? <RefreshCw size={16} className="spin" /> : null}
-        </div>
-        <div className="comparisonControlsBody">
-          <div className="comparisonFilterGrid">
-            <label>
-              Patient
-              <select value={selectedPatient} onChange={(e) => setSelectedPatient(e.target.value)}>
-                {patients.map((p) => <option key={p} value={p}>{p}</option>)}
-              </select>
-            </label>
-          </div>
-          {patientTrialRowsError ? <div className="errorBox">{patientTrialRowsError}</div> : null}
         </div>
       </section>
 
-      {selectedPatient ? (
-        <ConditionTrajectoriesGrid
-          sessions={sessions}
-          patient={selectedPatient}
-          alpha={0.2}
-          smoothTrajectory
-          smoothOnlySeeker
-          trialRows={patientTrialRows}
-        />
-      ) : null}
+      <div className="patientTrialList">
+        {patients.map((patient) => (
+          <PatientTrialSection key={patient} patient={patient} sessions={sessions} />
+        ))}
+      </div>
 
       <section className="card">
         <button type="button" className="collapseHeader" onClick={() => setCompareOpen(!compareOpen)} aria-expanded={compareOpen}>
