@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .analysis import (
     clear_caches,
     compare_sessions,
+    compare_trials,
     df_records,
     get_sessions_df,
     load_session_payload,
@@ -137,6 +138,25 @@ def compare(
             condition=condition,
             path_id=path_id,
             phase=phase,
+            include_suspicious=include_suspicious,
+        )
+        return {"rows": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/trials/compare")
+def trials_compare(
+    patients: Optional[List[str]] = Query(None),
+    condition: Optional[str] = Query(None),
+    path_id: Optional[str] = Query(None),
+    include_suspicious: bool = Query(True),
+):
+    try:
+        rows = compare_trials(
+            patients=patients,
+            condition=condition,
+            path_id=path_id,
             include_suspicious=include_suspicious,
         )
         return {"rows": rows}

@@ -59,6 +59,7 @@ def clear_caches() -> None:
     load_json_cached.cache_clear()
     build_sessions_index_cached.cache_clear()
     load_session_metrics.cache_clear()
+    load_trial_metrics.cache_clear()
 
 
 def discover_json_files(base_dir: Path) -> List[Tuple[Path, Optional[str]]]:
@@ -472,22 +473,48 @@ def compute_imu_quality(
 
     # Consecutive spike samples belong to one physical hit: merge samples closer
     # than 1 s (per tag) into a single event, keeping the peak acceleration.
-    events: List[Dict[str, Any]] = []
-    for imp in out["impacts"]:
-        prev = next((e for e in reversed(events) if e["tag_id"] == imp["tag_id"]), None)
-        if prev is not None and imp["t_s"] is not None and prev["end_t_s"] is not None and imp["t_s"] - prev["end_t_s"] <= 1.0:
-            prev["end_t_s"] = imp["t_s"]
-            prev["peak_accel"] = max(prev["peak_accel"], imp["accel_norm"])
-        else:
-            events.append({
-                "tag_id": imp["tag_id"],
-                "t_s": imp["t_s"],
-                "end_t_s": imp["t_s"],
-                "peak_accel": imp["accel_norm"],
-            })
+    events = merge_events(
+        out["impacts"], time_key="t_s", group_key="tag_id", gap_s=1.0,
+        value_key="accel_norm", value_out_key="peak_accel",
+    )
     out["events"] = events
     out["impact_count"] = len(events)
     return out
+
+
+def merge_events(
+    items: List[Dict[str, Any]],
+    time_key: str = "t_s",
+    group_key: Optional[str] = None,
+    gap_s: float = 1.0,
+    value_key: Optional[str] = None,
+    value_out_key: str = "peak",
+) -> List[Dict[str, Any]]:
+    """Merge consecutive items (matching on group_key, if given) that are at most
+    gap_s apart in time_key into single start/end events, keeping the max of
+    value_key (if given) as value_out_key on the merged event."""
+    events: List[Dict[str, Any]] = []
+    end_key = f"end_{time_key}"
+    for item in items:
+        t = item.get(time_key)
+        if group_key is not None:
+            prev = next((e for e in reversed(events) if e.get(group_key) == item.get(group_key)), None)
+        else:
+            prev = events[-1] if events else None
+        if prev is not None and t is not None and prev.get(end_key) is not None and t - prev[end_key] <= gap_s:
+            prev[end_key] = t
+            if value_key is not None:
+                prev[value_out_key] = max(prev[value_out_key], item.get(value_key))
+        else:
+            event: Dict[str, Any] = {}
+            if group_key is not None:
+                event[group_key] = item.get(group_key)
+            event[time_key] = t
+            event[end_key] = t
+            if value_key is not None:
+                event[value_out_key] = item.get(value_key)
+            events.append(event)
+    return events
 
 
 def compute_orientation_consistency(
@@ -558,6 +585,144 @@ def compute_orientation_consistency(
         "note": note,
     })
     return out
+
+
+def p1_xy(tracking_df: pd.DataFrame, seeker_id: str) -> pd.DataFrame:
+    """Seeker's own 2D trajectory (z is frequently NaN, so this stays 2D)."""
+    if tracking_df is None or tracking_df.empty:
+        return pd.DataFrame(columns=["timestamp", "t_s", "x", "y"])
+    cols = [c for c in ["timestamp", "t_s", "x", "y"] if c in tracking_df.columns]
+    p1 = tracking_df.loc[tracking_df["tag_id"] == seeker_id, cols].dropna(subset=["x", "y"])
+    return p1.sort_values("timestamp").reset_index(drop=True)
+
+
+def resample_by_arc_length(xy_df: pd.DataFrame, step_m: float) -> pd.DataFrame:
+    """Light median-smooth the path, then resample it at a fixed arc-length step
+    so trajectories with different sampling rates/durations become comparable."""
+    if xy_df is None or len(xy_df) < 2:
+        return pd.DataFrame(columns=["s_m", "x", "y"])
+    xs = xy_df["x"].astype(float).rolling(7, center=True, min_periods=1).median().to_numpy()
+    ys = xy_df["y"].astype(float).rolling(7, center=True, min_periods=1).median().to_numpy()
+    d = np.hypot(np.diff(xs), np.diff(ys))
+    s = np.concatenate([[0.0], np.cumsum(d)])
+    total_len = float(s[-1])
+    if total_len < step_m:
+        return pd.DataFrame(columns=["s_m", "x", "y"])
+    new_s = np.arange(0.0, total_len, step_m)
+    return pd.DataFrame({"s_m": new_s, "x": np.interp(new_s, s, xs), "y": np.interp(new_s, s, ys)})
+
+
+def _heading_change_deg(resampled: pd.DataFrame, step_m: float) -> np.ndarray:
+    """Absolute heading change (deg) over a ~0.9 m symmetric window, one value per
+    consecutive-point heading (i.e. length len(resampled) - 1), aligned to resampled.index."""
+    if resampled is None or len(resampled) < 3:
+        return np.array([])
+    x = resampled["x"].to_numpy()
+    y = resampled["y"].to_numpy()
+    heading = np.degrees(np.arctan2(np.diff(y), np.diff(x)))
+    heading_unwrapped = np.degrees(np.unwrap(np.radians(heading)))
+    heading_smooth = pd.Series(heading_unwrapped).rolling(5, center=True, min_periods=1).mean().to_numpy()
+    win = max(1, int(round(0.45 / step_m)))
+    n = len(heading_smooth)
+    if n <= 2 * win:
+        return np.zeros(n)
+    change = np.zeros(n)
+    change[win:n - win] = np.abs(heading_smooth[2 * win:] - heading_smooth[:n - 2 * win])
+    return change
+
+
+def detect_turns(xy_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Auto-detect up to 3 turns along a trajectory (used on the learning phase as the
+    "ideal"/learned reference — no hardcoded per-path waypoints)."""
+    step_m = settings.turn_resample_step_m
+    resampled = resample_by_arc_length(xy_df, step_m)
+    change = _heading_change_deg(resampled, step_m)
+    if len(change) == 0:
+        return []
+    min_gap_idx = max(1, int(round(settings.turn_min_separation_m / step_m)))
+    picks: List[int] = []
+    for i in np.argsort(-change):
+        if change[i] < settings.min_turn_heading_change_deg:
+            break
+        if all(abs(int(i) - p) > min_gap_idx for p in picks):
+            picks.append(int(i))
+        if len(picks) >= 3:
+            break
+    picks.sort()
+    turns = []
+    for turn_index, i in enumerate(picks):
+        row = resampled.iloc[i]
+        turns.append({
+            "turn_index": turn_index,
+            "s_m": float(row["s_m"]),
+            "x": float(row["x"]),
+            "y": float(row["y"]),
+            "heading_change_deg": float(change[i]),
+        })
+    return turns
+
+
+def heading_change_near_point(xy_df: pd.DataFrame, point_xy: Tuple[float, float], radius_m: float) -> Optional[float]:
+    """Heading change of xy_df's own trajectory at the point nearest to point_xy, or
+    None if the trajectory never comes within radius_m of it (turn never visited)."""
+    step_m = settings.turn_resample_step_m
+    resampled = resample_by_arc_length(xy_df, step_m)
+    change = _heading_change_deg(resampled, step_m)
+    if len(change) == 0:
+        return None
+    xs = resampled["x"].to_numpy()[: len(change)]
+    ys = resampled["y"].to_numpy()[: len(change)]
+    dists = np.hypot(xs - point_xy[0], ys - point_xy[1])
+    idx = int(np.argmin(dists))
+    if dists[idx] > radius_m:
+        return None
+    return float(change[idx])
+
+
+def compute_room_bbox(anchors_cfg: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    xs, ys = [], []
+    for a in anchors_cfg or []:
+        coords = a.get("coords") if isinstance(a, dict) else None
+        if coords and len(coords) >= 2:
+            xs.append(coords[0])
+            ys.append(coords[1])
+    if not xs or not ys:
+        return None
+    return {"x_min": float(min(xs)), "x_max": float(max(xs)), "y_min": float(min(ys)), "y_max": float(max(ys))}
+
+
+def compute_stop_events(speed_df: pd.DataFrame) -> Dict[str, Any]:
+    if speed_df is None or speed_df.empty or "speed_m_s_smooth" not in speed_df.columns:
+        return {"count": 0, "events": []}
+    slow = speed_df[pd.to_numeric(speed_df["speed_m_s_smooth"], errors="coerce") < settings.stop_speed_threshold_m_s]
+    items = [{"t_s": float(t)} for t in slow["t_s"].dropna().sort_values().to_numpy()]
+    events = merge_events(items, time_key="t_s", gap_s=0.3)
+    events = [e for e in events if (e["end_t_s"] - e["t_s"]) >= settings.stop_min_duration_s]
+    return {"count": len(events), "events": events}
+
+
+def compute_border_events(tracking_df: pd.DataFrame, seeker_id: str, bbox: Optional[Dict[str, float]]) -> Dict[str, Any]:
+    if not bbox or tracking_df is None or tracking_df.empty:
+        return {"count": 0, "events": [], "inner_box": None}
+    p1 = tracking_df.loc[tracking_df["tag_id"] == seeker_id, ["t_s", "x", "y"]].dropna(subset=["x", "y"]).sort_values("t_s")
+    if p1.empty:
+        return {"count": 0, "events": [], "inner_box": None}
+    x_span = bbox["x_max"] - bbox["x_min"]
+    y_span = bbox["y_max"] - bbox["y_min"]
+    # Longer anchor-span axis gets the larger margin (e.g. 12 m axis -> 8 m inner span);
+    # a square room (tie) falls back to treating y as the long axis.
+    if x_span > y_span:
+        margin_x, margin_y = settings.border_margin_long_m, settings.border_margin_short_m
+    else:
+        margin_x, margin_y = settings.border_margin_short_m, settings.border_margin_long_m
+    inner = {
+        "x_min": bbox["x_min"] + margin_x, "x_max": bbox["x_max"] - margin_x,
+        "y_min": bbox["y_min"] + margin_y, "y_max": bbox["y_max"] - margin_y,
+    }
+    outside = (p1["x"] < inner["x_min"]) | (p1["x"] > inner["x_max"]) | (p1["y"] < inner["y_min"]) | (p1["y"] > inner["y_max"])
+    items = [{"t_s": float(t)} for t in p1.loc[outside, "t_s"].dropna().to_numpy()]
+    events = merge_events(items, time_key="t_s", gap_s=0.3)
+    return {"count": len(events), "events": events, "inner_box": inner}
 
 
 def session_to_feedback_df(data: Dict[str, Any]) -> pd.DataFrame:
@@ -689,6 +854,8 @@ def metric_summary(
     feedback_df: pd.DataFrame,
     closest_df: pd.DataFrame,
     speed_df: pd.DataFrame,
+    tracking_df: Optional[pd.DataFrame] = None,
+    seeker_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {
         "duration_s": summary.get("duration_s"),
@@ -702,6 +869,8 @@ def metric_summary(
         "min_closest_distance": None,
         "mean_speed_m_s": None,
         "max_speed_m_s": None,
+        "total_distance_m": None,
+        "max_accel_norm": None,
         "feedback_events_per_min": None,
     }
     duration_s = summary.get("duration_s")
@@ -720,6 +889,12 @@ def metric_summary(
     if speed_df is not None and not speed_df.empty:
         metrics["mean_speed_m_s"] = _jsonable(pd.to_numeric(speed_df["speed_m_s_smooth"], errors="coerce").mean())
         metrics["max_speed_m_s"] = _jsonable(pd.to_numeric(speed_df["speed_m_s_smooth"], errors="coerce").max())
+        metrics["total_distance_m"] = _jsonable(pd.to_numeric(speed_df["step_distance"], errors="coerce").sum())
+    if tracking_df is not None and not tracking_df.empty and seeker_id is not None and "accel_norm" in tracking_df.columns:
+        seeker_accel = pd.to_numeric(tracking_df.loc[tracking_df["tag_id"] == seeker_id, "accel_norm"], errors="coerce")
+        seeker_accel = seeker_accel[seeker_accel > 0]  # zeros = IMU not streaming
+        if not seeker_accel.empty:
+            metrics["max_accel_norm"] = _jsonable(seeker_accel.max())
     return metrics
 
 
@@ -747,7 +922,7 @@ def _load_session_metrics_uncached(session_id: int) -> Dict[str, Any]:
     dist_df = compute_distances(tracking_df, seeker_id=config["seeker_id"], target_ids=config["target_ids"])
     closest_df = compute_closest_target_df(dist_df)
     speed_df = compute_speed_df(tracking_df, seeker_id=config["seeker_id"], rolling_window=settings.speed_rolling_window)
-    return metric_summary(summary, feedback_df, closest_df, speed_df)
+    return metric_summary(summary, feedback_df, closest_df, speed_df, tracking_df=tracking_df, seeker_id=config["seeker_id"])
 
 
 def load_session_payload(
@@ -791,7 +966,7 @@ def load_session_payload(
             how="left",
         )
     profile_df = config_to_profile_df(config)
-    metrics = metric_summary(summary, feedback_df, closest_df, speed_df)
+    metrics = metric_summary(summary, feedback_df, closest_df, speed_df, tracking_df=tracking_df, seeker_id=config["seeker_id"])
 
     # Keep quantitative metrics on the full data, but send lighter arrays to React/Recharts.
     # This prevents the UI from freezing on long sessions or high-frequency recordings.
@@ -857,4 +1032,195 @@ def compare_sessions(
             "warning": _jsonable(r["warning"]),
             **{k: _jsonable(v) for k, v in m.items()},
         })
+    return results
+
+
+def build_trials_df() -> pd.DataFrame:
+    """One row per (patient, condition, path_id, exploration attempt) — pairing every
+    exploration session with the learning session it should be compared against.
+
+    Reference learning session per trial: prefer the last non-interrupted one
+    (chronologically); if none qualify, fall back to the last one anyway and flag it.
+    Trials with zero exploration sessions still get one row (exploration_session_id=None)
+    so they aren't silently dropped from the table.
+    """
+    sessions_df = get_sessions_df()
+    if sessions_df.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    for (patient, condition, path_id), g in sessions_df.groupby(["patient", "condition", "path_id"], dropna=False):
+        condition_label = g["condition_label"].iloc[0] if "condition_label" in g else pretty_condition(condition)
+        learning = g[g["phase"] == "learning"].sort_values("start_time_dt")
+        exploration = g[g["phase"] == "exploration"].sort_values("start_time_dt")
+
+        learning_session_id: Optional[int] = None
+        learning_reference_flagged = False
+        learning_is_interrupt = False
+        if not learning.empty:
+            non_interrupt = learning[~learning["is_interrupt"]]
+            ref = non_interrupt.iloc[-1] if not non_interrupt.empty else learning.iloc[-1]
+            learning_session_id = int(ref["session_id"])
+            learning_is_interrupt = bool(ref["is_interrupt"])
+            learning_reference_flagged = non_interrupt.empty
+
+        base = {
+            "patient": patient, "condition": condition, "condition_label": condition_label, "path_id": path_id,
+            "learning_session_id": learning_session_id,
+            "learning_reference_flagged": learning_reference_flagged,
+        }
+
+        total_attempts = int(len(exploration))
+        if total_attempts == 0:
+            rows.append({
+                **base,
+                "exploration_session_id": None,
+                "attempt_number": None, "total_attempts": 0,
+                "attempt_lost": False,
+                "trial_got_lost": learning_is_interrupt,
+            })
+            continue
+
+        for attempt_number, (_, exp_row) in enumerate(exploration.iterrows(), start=1):
+            attempt_lost = bool(exp_row["is_interrupt"]) or bool(exp_row["is_suspicious_short"]) or attempt_number < total_attempts
+            rows.append({
+                **base,
+                "exploration_session_id": int(exp_row["session_id"]),
+                "attempt_number": attempt_number, "total_attempts": total_attempts,
+                "attempt_lost": attempt_lost,
+                "trial_got_lost": attempt_lost or learning_is_interrupt,
+            })
+    return pd.DataFrame(rows)
+
+
+def compute_trial_metrics(learning_session_id: Optional[int], exploration_session_id: Optional[int]) -> Dict[str, Any]:
+    """Compare an exploration trajectory against its trial's learning trajectory:
+    route overlap, turn-by-turn deviation, and stop/start position drift."""
+    empty = {
+        "overlap_pct": None, "mean_deviation_m": None,
+        "turns": [], "wrong_turns_count": None, "mean_turn_deviation_deg": None,
+        "stop_position_distance_m": None, "start_position_distance_m": None,
+    }
+    if learning_session_id is None or exploration_session_id is None:
+        return {**empty, "note": "missing learning or exploration session for this trial"}
+
+    sessions_df = get_sessions_df()
+    learn_row = sessions_df.iloc[int(learning_session_id)]
+    exp_row = sessions_df.iloc[int(exploration_session_id)]
+    learn_data = load_json_cached(str(learn_row["file_path"]))
+    exp_data = load_json_cached(str(exp_row["file_path"]))
+    learn_config = extract_config(learn_data)
+    exp_config = extract_config(exp_data)
+
+    learn_xy = p1_xy(session_to_tracking_df(learn_data), learn_config["seeker_id"])
+    exp_xy = p1_xy(session_to_tracking_df(exp_data), exp_config["seeker_id"])
+    if learn_xy.empty or exp_xy.empty:
+        return {**empty, "note": "empty trajectory for learning or exploration session"}
+
+    lx, ly = learn_xy["x"].to_numpy(), learn_xy["y"].to_numpy()
+    ex, ey = exp_xy["x"].to_numpy(), exp_xy["y"].to_numpy()
+
+    # Overlap: fraction of exploration points that fall within the buffer distance
+    # of the learning trajectory (nearest-neighbor distance, point-wise). Vectorized
+    # pairwise distance matrix instead of a Python-level loop: with sessions running
+    # into thousands of samples, a per-point loop held the GIL long enough to stall
+    # other concurrent requests (e.g. a rapid sequence of dropdown changes).
+    min_dist = np.hypot(ex[:, None] - lx[None, :], ey[:, None] - ly[None, :]).min(axis=1)
+    overlap_pct = float(100.0 * np.mean(min_dist <= settings.trial_overlap_buffer_m))
+    mean_deviation_m = float(min_dist.mean())
+
+    turns = detect_turns(learn_xy)
+    turn_results = []
+    deviations = []
+    for t in turns:
+        exp_change = heading_change_near_point(exp_xy, (t["x"], t["y"]), settings.turn_miss_radius_m)
+        deviation_deg = None
+        wrong_turn = True
+        if exp_change is not None:
+            deviation_deg = float(abs((exp_change - t["heading_change_deg"] + 180.0) % 360.0 - 180.0))
+            wrong_turn = deviation_deg > settings.wrong_turn_threshold_deg
+        turn_results.append({
+            "turn_index": t["turn_index"],
+            "learned_heading_change_deg": t["heading_change_deg"],
+            "exploration_heading_change_deg": exp_change,
+            "deviation_deg": deviation_deg,
+            "wrong_turn": wrong_turn,
+        })
+        if deviation_deg is not None:
+            deviations.append(deviation_deg)
+
+    return {
+        "overlap_pct": overlap_pct,
+        "mean_deviation_m": mean_deviation_m,
+        "turns": turn_results,
+        "wrong_turns_count": sum(1 for t in turn_results if t["wrong_turn"]),
+        "mean_turn_deviation_deg": float(np.mean(deviations)) if deviations else None,
+        # Stopping position: how far the exploration end point is from where the
+        # participant stopped during learning.
+        "stop_position_distance_m": float(math.hypot(lx[-1] - ex[-1], ly[-1] - ey[-1])),
+        # "Estimated start" at the end of the trial: exploration's own end point,
+        # compared against the learning phase's *start* position (per protocol).
+        "start_position_distance_m": float(math.hypot(lx[0] - ex[-1], ly[0] - ey[-1])),
+    }
+
+
+@lru_cache(maxsize=2048)
+def load_trial_metrics(learning_session_id: Optional[int], exploration_session_id: Optional[int]) -> Dict[str, Any]:
+    return compute_trial_metrics(learning_session_id, exploration_session_id)
+
+
+def compare_trials(
+    patients: Optional[List[str]] = None,
+    condition: Optional[str] = None,
+    path_id: Optional[str] = None,
+    include_suspicious: bool = True,
+) -> List[Dict[str, Any]]:
+    trials_df = build_trials_df()
+    if trials_df.empty:
+        return []
+    df = trials_df.copy()
+    if patients:
+        df = df[df["patient"].isin(patients)]
+    if condition and condition != "all":
+        df = df[df["condition"] == condition]
+    if path_id and path_id != "all":
+        df = df[df["path_id"] == path_id]
+    if not include_suspicious:
+        df = df[~df["attempt_lost"]]
+
+    sessions_df = get_sessions_df()
+    results: List[Dict[str, Any]] = []
+    for _, r in df.iterrows():
+        learning_id = int(r["learning_session_id"]) if pd.notna(r["learning_session_id"]) else None
+        exploration_id = int(r["exploration_session_id"]) if pd.notna(r["exploration_session_id"]) else None
+        row_out: Dict[str, Any] = {
+            "patient": _jsonable(r["patient"]),
+            "condition": _jsonable(r["condition"]),
+            "condition_label": _jsonable(r["condition_label"]),
+            "path_id": _jsonable(r["path_id"]),
+            "learning_session_id": learning_id,
+            "exploration_session_id": exploration_id,
+            "attempt_number": _jsonable(r["attempt_number"]),
+            "total_attempts": _jsonable(r["total_attempts"]),
+            "got_lost": bool(r["trial_got_lost"]),
+        }
+        try:
+            metrics = load_trial_metrics(learning_id, exploration_id)
+            row_out.update({k: (v if k == "turns" else _jsonable(v)) for k, v in metrics.items()})
+
+            if exploration_id is not None:
+                exp_row = sessions_df.iloc[exploration_id]
+                exp_data = load_json_cached(str(exp_row["file_path"]))
+                exp_config = extract_config(exp_data)
+                exp_tracking = session_to_tracking_df(exp_data)
+                speed_df = compute_speed_df(exp_tracking, seeker_id=exp_config["seeker_id"], rolling_window=settings.speed_rolling_window)
+                bbox = compute_room_bbox(exp_config["anchors"])
+                row_out["stop_count"] = compute_stop_events(speed_df)["count"]
+                row_out["border_reached_count"] = compute_border_events(exp_tracking, exp_config["seeker_id"], bbox)["count"]
+            else:
+                row_out["stop_count"] = None
+                row_out["border_reached_count"] = None
+        except Exception as exc:
+            row_out["error"] = str(exc)
+        results.append(row_out)
     return results
