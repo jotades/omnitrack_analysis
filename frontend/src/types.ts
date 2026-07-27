@@ -133,6 +133,8 @@ export interface MetricSummary {
   min_closest_distance: number | null;
   mean_speed_m_s: number | null;
   max_speed_m_s: number | null;
+  total_distance_m: number | null;
+  max_accel_norm: number | null;
   feedback_events_per_min: number | null;
 }
 
@@ -165,4 +167,35 @@ export interface CompareRow extends MetricSummary {
   path_id: string;
   start_time: string | null;
   warning: string;
+}
+
+export interface TrialTurn {
+  turn_index: number;
+  learned_heading_change_deg: number | null;
+  exploration_heading_change_deg: number | null;
+  deviation_deg: number | null;
+  wrong_turn: boolean;
+}
+
+export interface TrialRow {
+  patient: string;
+  condition: string;
+  condition_label: string;
+  path_id: string;
+  learning_session_id: number | null;
+  exploration_session_id: number | null;
+  attempt_number: number | null;
+  total_attempts: number | null;
+  got_lost: boolean;
+  overlap_pct: number | null;
+  mean_deviation_m: number | null;
+  turns: TrialTurn[];
+  wrong_turns_count: number | null;
+  mean_turn_deviation_deg: number | null;
+  stop_position_distance_m: number | null;
+  start_position_distance_m: number | null;
+  stop_count: number | null;
+  border_reached_count: number | null;
+  note?: string;
+  error?: string;
 }

@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { GitCompareArrows, Moon, RefreshCw, Sun, User } from 'lucide-react';
-import { fetchSessionDetail, fetchSessions, refreshIndex } from './api';
-import type { SessionPayload, SessionRow } from './types';
+import { Footprints, GitCompareArrows, Moon, RefreshCw, Sun, User } from 'lucide-react';
+import { fetchSessionDetail, fetchSessions, fetchTrialRows, refreshIndex } from './api';
+import type { SessionPayload, SessionRow, TrialRow } from './types';
 import { Controls } from './components/Controls';
-import { MetricCards } from './components/MetricCards';
+import { PatientSummaryCards } from './components/PatientSummaryCards';
 import { QualityIndicators } from './components/QualityIndicators';
 import { PlaybackControls } from './components/PlaybackControls';
 import { Trajectory2D } from './components/Trajectory2D';
 import { OrientationBox3D } from './components/OrientationBox3D';
-import { ConditionTrajectoriesGrid } from './components/ConditionTrajectoriesGrid';
+import { TrialMiniStats } from './components/ConditionTrajectoriesGrid';
+import { ChartCard } from './components/ChartCard';
 import {
   ClosestAndFeedbackChart,
   DistanceChart,
@@ -18,10 +19,11 @@ import {
   SpeedChart,
 } from './components/TimeSeriesCharts';
 import { ComparisonPanel } from './components/ComparisonPanel';
+import { TrialsPanel } from './components/TrialsPanel';
 import { ProfilesTable, SessionStatusTable } from './components/SessionTables';
 import './styles.css';
 
-export type AnalysisMode = 'single' | 'compare';
+export type AnalysisMode = 'single' | 'compare' | 'trials';
 type Theme = 'light' | 'dark';
 
 function firstOrEmpty(values: string[]) {
@@ -253,6 +255,27 @@ export default function App() {
 
   const currentSession = sessions.find((s) => s.session_id === selectedSessionId) ?? null;
 
+  // Trial metrics (overlap, turn deviation, stops, border...) for whichever
+  // (patient, condition, path) trial the currently selected session belongs to.
+  const [sessionTrialRows, setSessionTrialRows] = useState<TrialRow[]>([]);
+  useEffect(() => {
+    if (!selectedPatient || !selectedCondition || !selectedPath) { setSessionTrialRows([]); return; }
+    const controller = new AbortController();
+    fetchTrialRows({ patients: [selectedPatient], condition: selectedCondition, pathId: selectedPath, includeSuspicious: true, signal: controller.signal })
+      .then(setSessionTrialRows)
+      .catch((e) => { if (!(e instanceof DOMException && e.name === 'AbortError')) setSessionTrialRows([]); });
+    return () => controller.abort();
+  }, [selectedPatient, selectedCondition, selectedPath]);
+
+  const currentTrialRow = useMemo(() => {
+    if (!sessionTrialRows.length || !currentSession) return null;
+    if (currentSession.phase === 'exploration') {
+      return sessionTrialRows.find((r) => r.exploration_session_id === currentSession.session_id) ?? null;
+    }
+    // Learning is the shared reference across attempts: show the most recent attempt's trial metrics.
+    return sessionTrialRows[sessionTrialRows.length - 1] ?? null;
+  }, [sessionTrialRows, currentSession]);
+
   const phaseOverlaySessionIds = useMemo(() => {
     if (!currentSession) return [] as number[];
     const sameBlock = sortSessions(
@@ -382,6 +405,19 @@ export default function App() {
             <small>Aggregate metrics across phases or across patients</small>
           </span>
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={analysisMode === 'trials'}
+          className={analysisMode === 'trials' ? 'active' : ''}
+          onClick={() => setAnalysisMode('trials')}
+        >
+          <Footprints size={16} />
+          <span>
+            <strong>Trial metrics</strong>
+            <small>Exploration vs. learning: overlap, turns, stops, border, lost trials</small>
+          </span>
+        </button>
       </div>
 
       {analysisMode === 'single' ? (
@@ -414,6 +450,8 @@ export default function App() {
 
       {analysisMode === 'compare' ? (
         <ComparisonPanel sessions={sessions} />
+      ) : analysisMode === 'trials' ? (
+        <TrialsPanel sessions={sessions} />
       ) : (
         <>
           {currentSession ? (
@@ -429,7 +467,7 @@ export default function App() {
           {phaseOverlayLoading ? <div className="loading inlineLoading"><RefreshCw className="spin" /> Loading learning/exploration overlay...</div> : null}
 
           {payload ? <QualityIndicators payload={payload} /> : null}
-          {payload ? <MetricCards metrics={payload.metrics} /> : null}
+          {selectedPatient ? <PatientSummaryCards patient={selectedPatient} /> : null}
 
           {payload ? (
             <PlaybackControls
@@ -445,27 +483,38 @@ export default function App() {
             />
           ) : null}
 
+          {payload ? (
+            <div className="chartWithStats">
+              <Trajectory2D
+                payload={payload}
+                showCookedOverlay={showCookedOverlay}
+                playbackTime={controlledTime}
+                duration={duration}
+                onCursorTime={handleCursorTime}
+                phaseOverlayPayloads={phaseOverlayPayloads}
+                showPhaseOverlay={showPhaseOverlay}
+                onShowPhaseOverlay={setShowPhaseOverlay}
+              />
+              <div className="statsStack">
+                <ChartCard
+                  title="Session & trial metrics"
+                  subtitle={currentSession ? `${currentSession.phase} · ${currentSession.path_id}` : undefined}
+                >
+                  <TrialMiniStats row={currentTrialRow} metrics={payload.metrics} />
+                </ChartCard>
+                <OrientationBox3D
+                  payload={payload}
+                  phaseOverlayPayloads={phaseOverlayPayloads}
+                  playbackTime={controlledTime}
+                  duration={duration}
+                />
+              </div>
+            </div>
+          ) : null}
+
           <section className="dashboardGrid">
             {payload ? (
               <>
-                <Trajectory2D
-                  payload={payload}
-                  showCookedOverlay={showCookedOverlay}
-                  playbackTime={controlledTime}
-                  duration={duration}
-                  onCursorTime={handleCursorTime}
-                  phaseOverlayPayloads={phaseOverlayPayloads}
-                  showPhaseOverlay={showPhaseOverlay}
-                  onShowPhaseOverlay={setShowPhaseOverlay}
-                />
-                <ConditionTrajectoriesGrid
-                  sessions={sessions}
-                  patient={selectedPatient}
-                  alpha={alpha}
-                  smoothTrajectory={smoothTrajectory}
-                  smoothOnlySeeker={smoothOnlySeeker}
-                />
-                <OrientationBox3D payload={payload} playbackTime={controlledTime} duration={duration} />
                 <OrientationAnglesChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
                 <DistanceChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />
                 <ClosestAndFeedbackChart payload={payload} playbackTime={controlledTime} duration={duration} onCursorTime={handleCursorTime} />

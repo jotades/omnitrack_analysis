@@ -1,4 +1,4 @@
-import type { CompareRow, SessionPayload, SessionRow } from './types';
+import type { CompareRow, SessionPayload, SessionRow, TrialRow } from './types';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '';
 
@@ -53,5 +53,21 @@ export async function fetchCompareRows(opts: {
   if (opts.phase) params.set('phase', opts.phase);
   params.set('include_suspicious', String(opts.includeSuspicious ?? true));
   const data = await getJson<{ rows: CompareRow[] }>(`/api/compare?${params}`);
+  return data.rows;
+}
+
+export async function fetchTrialRows(opts: {
+  patients?: string[];
+  condition?: string;
+  pathId?: string;
+  includeSuspicious?: boolean;
+  signal?: AbortSignal;
+}): Promise<TrialRow[]> {
+  const params = new URLSearchParams();
+  opts.patients?.forEach((p) => params.append('patients', p));
+  if (opts.condition) params.set('condition', opts.condition);
+  if (opts.pathId) params.set('path_id', opts.pathId);
+  params.set('include_suspicious', String(opts.includeSuspicious ?? true));
+  const data = await getJson<{ rows: TrialRow[] }>(`/api/trials/compare?${params}`, { signal: opts.signal });
   return data.rows;
 }
