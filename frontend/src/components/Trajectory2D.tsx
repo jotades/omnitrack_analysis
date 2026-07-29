@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import {
   CartesianGrid,
+  LabelList,
   ReferenceArea,
   ReferenceDot,
   ReferenceLine,
@@ -195,6 +196,8 @@ export function Trajectory2D({
   const [showLearning, setShowLearning] = useState(true);
   const [showExploration, setShowExploration] = useState(true);
   const [showBorder, setShowBorder] = useState(false);
+  const [showAnchors, setShowAnchors] = useState(false);
+  const [showGrid, setShowGrid] = useState(true);
   const hoverAreaRef = useRef<HTMLDivElement | null>(null);
   const preHoverTimeRef = useRef<number | null>(null);
 
@@ -239,6 +242,24 @@ export function Trajectory2D({
     const y2ds = corners.map((c) => c.y2d);
     return { x1: Math.min(...x2ds), x2: Math.max(...x2ds), y1: Math.min(...y2ds), y2: Math.max(...y2ds) };
   }, [showBorder, payload.config.anchors, roomX, roomY, rotate90]);
+
+  // UWB anchor positions — shaped like a tracked-point ("tag_id"/"xRaw2d"/
+  // "yRaw2d") so the existing TrajectoryTooltip shows exact coordinates on
+  // hover with no extra tooltip logic needed.
+  const anchorPoints = useMemo(() => {
+    const anchors = payload.config.anchors ?? [];
+    return anchors
+      .map((a) => {
+        const coords = (a as { coords?: unknown[] })?.coords;
+        const id = (a as { id?: string })?.id;
+        if (!Array.isArray(coords) || !isFiniteNumber(coords[0]) || !isFiniteNumber(coords[1])) return null;
+        const x = coords[0] as number;
+        const y = coords[1] as number;
+        const t = transformPoint(x, y, roomX, roomY, rotate90);
+        return { tag_id: id ?? 'anchor', xRaw2d: x, yRaw2d: y, x2d: t.x2d, y2d: t.y2d };
+      })
+      .filter((p): p is { tag_id: string; xRaw2d: number; yRaw2d: number; x2d: number; y2d: number } => p !== null);
+  }, [payload.config.anchors, roomX, roomY, rotate90]);
   const computedDuration = duration ?? payload.metrics.duration_s ?? Math.max(0, ...payload.tracking.map((p) => p.t_s).filter(isFiniteNumber));
   const t = clampTime(playbackTime, computedDuration);
   const seeker = payload.config.seeker_id;
@@ -381,6 +402,14 @@ export function Trajectory2D({
               <input type="checkbox" checked={showBorder} onChange={(e) => setShowBorder(e.target.checked)} />
               Border 8×6 m
             </label>
+            <label className="inlineCheck">
+              <input type="checkbox" checked={showAnchors} onChange={(e) => setShowAnchors(e.target.checked)} />
+              Anchors
+            </label>
+            <label className="inlineCheck">
+              <input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} />
+              Grid 1×1 m
+            </label>
             <label>
               Room
               <select value={roomPreset} onChange={(e) => setRoomPreset(e.target.value as RoomPreset)}>
@@ -421,7 +450,7 @@ export function Trajectory2D({
                   height={height}
                   margin={{ top: 18, right: 26, bottom: 36, left: 12 }}
                 >
-                  <CartesianGrid strokeDasharray="3 3" />
+                  {showGrid ? <CartesianGrid strokeDasharray="3 3" /> : null}
                   <XAxis
                     type="number"
                     dataKey="x2d"
@@ -455,6 +484,19 @@ export function Trajectory2D({
                       fill={BORDER_COLOR} fillOpacity={0.05}
                       ifOverflow="visible"
                     />
+                  ) : null}
+
+                  {showAnchors && anchorPoints.length ? (
+                    <Scatter
+                      name="anchor"
+                      data={anchorPoints}
+                      shape="square"
+                      fill="#7a5af8"
+                      fillOpacity={0.85}
+                      isAnimationActive={false}
+                    >
+                      <LabelList dataKey="tag_id" position="top" style={{ fontSize: 10, fill: '#7a5af8' }} />
+                    </Scatter>
                   ) : null}
 
                   {seekerFull.length ? (

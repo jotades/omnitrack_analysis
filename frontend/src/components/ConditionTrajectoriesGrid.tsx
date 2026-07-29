@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshCw } from 'lucide-react';
-import { fetchSessionDetail } from '../api';
-import type { MetricSummary, SessionPayload, SessionRow, TrackingPoint, TrialRow } from '../types';
+import { Info, RefreshCw } from 'lucide-react';
+import { fetchSessionDetail, saveAnnotation } from '../api';
+import type { MetricSummary, SessionPayload, SessionRow, TargetDiscovery, TrackingPoint, TrialRow } from '../types';
 
 /**
  * Overview grid for one patient: one mini chart per condition × path (8 with
@@ -28,17 +28,56 @@ const ROOM_Y = 12;
 const MINI_W = 300;
 const MINI_H = 210;
 const MARGIN = 10;
+const BORDER_COLOR = '#f79009';
+// Centered "safe" inner box, same margins as the backend's border_reached_count
+// and the Single Session 2D room trajectory's "Border 8×6 m" flag.
+const BORDER_MARGIN_LONG_M = 2.0;
+const BORDER_MARGIN_SHORT_M = 1.0;
+
+// 1×1 m reference grid, precomputed once: room-x integers (0..ROOM_X) become
+// horizontal lines, room-y integers (0..ROOM_Y) become vertical lines (the
+// mini view is rotated the same way as toSvg).
+const MINI_GRID = (() => {
+  const horizontals: number[] = [];
+  for (let rx = 0; rx <= ROOM_X; rx++) {
+    const py = (ROOM_X - rx) / ROOM_X;
+    horizontals.push(MARGIN + (1 - py) * (MINI_H - 2 * MARGIN));
+  }
+  const verticals: number[] = [];
+  for (let ry = 0; ry <= ROOM_Y; ry++) {
+    const px = ry / ROOM_Y;
+    verticals.push(MARGIN + px * (MINI_W - 2 * MARGIN));
+  }
+  return { horizontals, verticals };
+})();
 
 interface Props {
   sessions: SessionRow[];
   patient: string;
-  alpha: number;
-  smoothTrajectory: boolean;
-  smoothOnlySeeker: boolean;
   trialRows: TrialRow[];
   /** Skip the outer card + header — for embedding inside a per-patient
    * collapsible section that already provides its own title. */
   bare?: boolean;
+  /** Fired after any per-trial annotation save, so an ancestor holding its own
+   * copies of trial data (the collapsed header's lost-count badge and
+   * aggregate tiles, General statistics) knows what changed — this grid's own
+   * `annotationOverrides` state only affects what's rendered inside itself. */
+  onAnnotationSaved?: (info: { condition: string; pathId: string; explorationSessionId: number | null; excludedFromStats: boolean }) => void;
+  // Toolbar settings are controlled by the parent (PatientTrialSection) so
+  // they survive the dropdown closing — this grid only mounts while open,
+  // so state kept here would reset to defaults every time it's reopened.
+  showBorder: boolean;
+  onShowBorder: (v: boolean) => void;
+  showAnchors: boolean;
+  onShowAnchors: (v: boolean) => void;
+  showGrid: boolean;
+  onShowGrid: (v: boolean) => void;
+  alpha: number;
+  onAlpha: (v: number) => void;
+  smoothTrajectory: boolean;
+  onSmoothTrajectory: (v: boolean) => void;
+  smoothOnlySeeker: boolean;
+  onSmoothOnlySeeker: (v: boolean) => void;
 }
 
 interface CellPhase {
@@ -72,6 +111,13 @@ function fmt(value: number | null | undefined, digits = 1, suffix = '') {
   return `${value.toFixed(digits)}${suffix}`;
 }
 
+/** Distance label plus the ideal (learning) point it's measured against, e.g. "1.23 m (ideal 2.1, 4.5)". */
+function fmtDeltaWithIdeal(value: number | null | undefined, ideal: [number, number] | null | undefined) {
+  const base = fmt(value, 2, ' m');
+  if (base === '—' || !ideal) return base;
+  return `${base} (ideal ${ideal[0].toFixed(1)}, ${ideal[1].toFixed(1)})`;
+}
+
 /** Room (rotated 90°) → mini SVG coordinates. */
 function toSvg(x: number, y: number) {
   const px = y / ROOM_Y; // display X: original y, 0..12
@@ -82,15 +128,68 @@ function toSvg(x: number, y: number) {
   };
 }
 
-function seekerPolyline(payload: SessionPayload): { d: string; start?: { x: number; y: number }; end?: { x: number; y: number } } {
+type MiniEndpoint = { x: number; y: number; rawX: number; rawY: number; t: number };
+
+function seekerPolyline(payload: SessionPayload): { d: string; start?: MiniEndpoint; end?: MiniEndpoint } {
   const seeker = payload.config.seeker_id;
-  const pts = payload.tracking
+  const rawPts = payload.tracking
     .filter((p: TrackingPoint) => p.tag_id === seeker && isFiniteNumber(p.x_plot) && isFiniteNumber(p.y_plot) && isFiniteNumber(p.t_s))
-    .sort((a, b) => a.t_s - b.t_s)
-    .map((p) => toSvg(p.x_plot as number, p.y_plot as number));
-  if (!pts.length) return { d: '' };
+    .sort((a, b) => a.t_s - b.t_s);
+  if (!rawPts.length) return { d: '' };
+  const pts = rawPts.map((p) => toSvg(p.x_plot as number, p.y_plot as number));
   const d = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join('');
-  return { d, start: pts[0], end: pts[pts.length - 1] };
+  const first = rawPts[0];
+  const last = rawPts[rawPts.length - 1];
+  return {
+    d,
+    start: { ...pts[0], rawX: first.x_plot as number, rawY: first.y_plot as number, t: first.t_s },
+    end: { ...pts[pts.length - 1], rawX: last.x_plot as number, rawY: last.y_plot as number, t: last.t_s },
+  };
+}
+
+function borderRectSvg(payload: SessionPayload | undefined): { x: number; y: number; width: number; height: number } | null {
+  const anchors = payload?.config.anchors ?? [];
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const a of anchors) {
+    const coords = (a as { coords?: unknown[] })?.coords;
+    if (Array.isArray(coords) && isFiniteNumber(coords[0]) && isFiniteNumber(coords[1])) {
+      xs.push(coords[0] as number);
+      ys.push(coords[1] as number);
+    }
+  }
+  if (!xs.length || !ys.length) return null;
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const [marginX, marginY] = (xMax - xMin) > (yMax - yMin)
+    ? [BORDER_MARGIN_LONG_M, BORDER_MARGIN_SHORT_M]
+    : [BORDER_MARGIN_SHORT_M, BORDER_MARGIN_LONG_M];
+  const corners = [
+    [xMin + marginX, yMin + marginY],
+    [xMax - marginX, yMin + marginY],
+    [xMax - marginX, yMax - marginY],
+    [xMin + marginX, yMax - marginY],
+  ].map(([x, y]) => toSvg(x, y));
+  const xsSvg = corners.map((c) => c.x);
+  const ysSvg = corners.map((c) => c.y);
+  const x = Math.min(...xsSvg), x2 = Math.max(...xsSvg);
+  const y = Math.min(...ysSvg), y2 = Math.max(...ysSvg);
+  return { x, y, width: x2 - x, height: y2 - y };
+}
+
+function anchorMarkers(payload: SessionPayload) {
+  const anchors = payload.config.anchors ?? [];
+  return anchors
+    .map((a) => {
+      const coords = (a as { coords?: unknown[] })?.coords;
+      const id = (a as { id?: string })?.id;
+      if (!Array.isArray(coords) || !isFiniteNumber(coords[0]) || !isFiniteNumber(coords[1])) return null;
+      const rawX = coords[0] as number;
+      const rawY = coords[1] as number;
+      const pt = toSvg(rawX, rawY);
+      return { id: id ?? 'anchor', rawX, rawY, ...pt };
+    })
+    .filter((m): m is { id: string; rawX: number; rawY: number; x: number; y: number } => m !== null);
 }
 
 function targetMarkers(payload: SessionPayload) {
@@ -100,19 +199,44 @@ function targetMarkers(payload: SessionPayload) {
     if (!pts.length) return null;
     const xs = pts.map((p) => p.x as number).sort((a, b) => a - b);
     const ys = pts.map((p) => p.y as number).sort((a, b) => a - b);
-    const med = toSvg(xs[xs.length >> 1], ys[ys.length >> 1]);
-    return { id: tid, ...med };
-  }).filter((m): m is { id: string; x: number; y: number } => m !== null);
+    const rawX = xs[xs.length >> 1];
+    const rawY = ys[ys.length >> 1];
+    return { id: tid, rawX, rawY, ...toSvg(rawX, rawY) };
+  }).filter((m): m is { id: string; rawX: number; rawY: number; x: number; y: number } => m !== null);
 }
 
-function MiniTrajectory({ payloads }: { payloads: Array<{ phase: PhaseName; payload: SessionPayload }> }) {
+function MiniTrajectory({ payloads, showBorder, showAnchors, showGrid }: { payloads: Array<{ phase: PhaseName; payload: SessionPayload }>; showBorder: boolean; showAnchors: boolean; showGrid: boolean }) {
   const targets = payloads.length ? targetMarkers(payloads[0].payload) : [];
+  const anchors = showAnchors && payloads.length ? anchorMarkers(payloads[0].payload) : [];
+  const borderRect = showBorder ? borderRectSvg(payloads[0]?.payload) : null;
   return (
     <svg viewBox={`0 0 ${MINI_W} ${MINI_H}`} className="miniTrajSvg">
       <rect x={MARGIN} y={MARGIN} width={MINI_W - 2 * MARGIN} height={MINI_H - 2 * MARGIN}
         fill="none" stroke="var(--border)" strokeWidth={1} rx={3} />
+      {showGrid ? (
+        <g className="miniGridLines">
+          {MINI_GRID.horizontals.map((y, i) => (
+            <line key={`h${i}`} x1={MARGIN} x2={MINI_W - MARGIN} y1={y} y2={y} stroke="var(--border)" strokeWidth={0.5} opacity={0.5} />
+          ))}
+          {MINI_GRID.verticals.map((x, i) => (
+            <line key={`v${i}`} x1={x} x2={x} y1={MARGIN} y2={MINI_H - MARGIN} stroke="var(--border)" strokeWidth={0.5} opacity={0.5} />
+          ))}
+        </g>
+      ) : null}
+      {borderRect ? (
+        <rect x={borderRect.x} y={borderRect.y} width={borderRect.width} height={borderRect.height}
+          fill={BORDER_COLOR} fillOpacity={0.06} stroke={BORDER_COLOR} strokeDasharray="4 3" strokeWidth={1} />
+      ) : null}
+      {anchors.map((a) => (
+        <g key={a.id} className="miniAnchorMarker">
+          <title>{`${a.id}: x=${a.rawX.toFixed(2)} m, y=${a.rawY.toFixed(2)} m`}</title>
+          <rect x={a.x - 3} y={a.y - 3} width={6} height={6} fill="#7a5af8" opacity={0.85} />
+          <text x={a.x + 5} y={a.y + 3} fontSize={8} fill="#7a5af8" opacity={0.9}>{a.id}</text>
+        </g>
+      ))}
       {targets.map((t) => (
-        <g key={t.id}>
+        <g key={t.id} className="miniAnchorMarker">
+          <title>{`${t.id}: x=${t.rawX.toFixed(2)} m, y=${t.rawY.toFixed(2)} m`}</title>
           <path d={`M${t.x - 4},${t.y - 4}L${t.x + 4},${t.y + 4}M${t.x - 4},${t.y + 4}L${t.x + 4},${t.y - 4}`}
             stroke="currentColor" strokeWidth={1.4} opacity={0.55} />
           <text x={t.x + 6} y={t.y - 4} fontSize={9} fill="currentColor" opacity={0.6}>{t.id}</text>
@@ -125,8 +249,16 @@ function MiniTrajectory({ payloads }: { payloads: Array<{ phase: PhaseName; payl
         return (
           <g key={phase}>
             <path d={d} fill="none" stroke={color} strokeWidth={1.6} opacity={0.85} />
-            {start ? <circle cx={start.x} cy={start.y} r={3.4} fill="var(--surface)" stroke={color} strokeWidth={1.6} /> : null}
-            {end ? <circle cx={end.x} cy={end.y} r={3.4} fill={color} /> : null}
+            {start ? (
+              <circle cx={start.x} cy={start.y} r={3.4} fill="var(--surface)" stroke={color} strokeWidth={1.6} className="miniAnchorMarker">
+                <title>{`${phase} start: t=${start.t.toFixed(1)}s, x=${start.rawX.toFixed(2)} m, y=${start.rawY.toFixed(2)} m`}</title>
+              </circle>
+            ) : null}
+            {end ? (
+              <circle cx={end.x} cy={end.y} r={3.4} fill={color} className="miniAnchorMarker">
+                <title>{`${phase} end: t=${end.t.toFixed(1)}s, x=${end.rawX.toFixed(2)} m, y=${end.rawY.toFixed(2)} m`}</title>
+              </circle>
+            ) : null}
           </g>
         );
       })}
@@ -134,13 +266,44 @@ function MiniTrajectory({ payloads }: { payloads: Array<{ phase: PhaseName; payl
   );
 }
 
+// One-line explanation per stat, shown on hover via the small info icon next
+// to each label — exact definitions from the backend (analysis.py / settings.py).
+const STAT_INFO: Record<string, string> = {
+  'Overlap': 'Share of exploration-path points that fall within 0.5 m of the learning route (nearest-neighbor distance to the learned trajectory).',
+  'Turn dev': "Mean degrees the exploration's turn angle differs from the learning phase's angle, averaged over the turns (up to 3) auto-detected along the learned route. Turns are wherever the learning trajectory actually turned — not assumed to be 90°.",
+  'Wrong turns': 'Of the auto-detected learned turns (up to 3), how many the exploration either missed entirely (never came within 1.5 m of that point) or took at an angle more than 45° off the learned turn.',
+  'Stop Δ': 'Distance between the exploration’s last tracked position and the learning trajectory’s own end point — the "ideal" stop location, whose coordinates are shown in brackets.',
+  'Start Δ': 'Distance between the exploration’s first tracked position and the learning trajectory’s own start point — the "ideal" start location, whose coordinates are shown in brackets.',
+  'Stops': 'Number of times the participant paused (speed below 0.08 m/s for at least 1 s) during this exploration attempt.',
+  'Border': 'Number of times the participant stepped outside the centered 8×6 m safety box during this exploration attempt.',
+  'Duration': 'Length of this exploration attempt.',
+  'Feedback': 'Number of feedback events (audio/haptic cues) delivered during this attempt.',
+  'Mean intensity': 'Average intensity of the feedback delivered during this attempt.',
+  'Mean speed': 'Average walking speed during this exploration attempt.',
+  'Min closest': 'Closest distance reached to any target during this exploration attempt.',
+  'Return Δ': 'Distance between the exploration’s LAST tracked position and the learning trajectory’s own start point — did they go out and come back? This is how "completed the path" is defined; coordinates of the ideal return point are shown in brackets.',
+  'Found': 'How many of the trial’s targets (O1/O2/O3) triggered at least one feedback event during this exploration attempt, out of how many were placed on this path. "in order"/"out of order" compares the order they were first triggered against the path’s intended visit order (from the learning session).',
+  'Impacts': 'Total probable physical hits on any target sensor during this exploration attempt (a target’s accelerometer spiking above its stationary baseline).',
+};
+
+function fmtFound(td: TargetDiscovery | null): string {
+  if (!td) return '—';
+  const total = td.targets.length;
+  if (!total) return '—';
+  const orderTag = td.found_count === 0 ? '' : td.in_order ? ' (in order)' : ' (out of order)';
+  return `${td.found_count}/${total}${orderTag}`;
+}
+
 export function TrialMiniStats({ row, metrics }: { row: TrialRow | null; metrics?: MetricSummary | null }) {
   const stats: Array<[string, string]> = row ? [
     ['Overlap', fmt(row.overlap_pct, 0, '%')],
     ['Turn dev', fmt(row.mean_turn_deviation_deg, 0, '°')],
     ['Wrong turns', row.wrong_turns_count != null ? String(row.wrong_turns_count) : '—'],
-    ['Stop Δ', fmt(row.stop_position_distance_m, 2, ' m')],
-    ['Start Δ', fmt(row.start_position_distance_m, 2, ' m')],
+    ['Stop Δ', fmtDeltaWithIdeal(row.stop_position_distance_m, row.ideal_stop_xy)],
+    ['Start Δ', fmtDeltaWithIdeal(row.start_position_distance_m, row.ideal_start_xy)],
+    ['Return Δ', fmtDeltaWithIdeal(row.return_to_start_distance_m, row.ideal_start_xy)],
+    ['Found', fmtFound(row.target_discovery)],
+    ['Impacts', String(Object.values(row.target_impacts ?? {}).reduce((a, b) => a + b, 0))],
     ['Stops', row.stop_count != null ? String(row.stop_count) : '—'],
     ['Border', row.border_reached_count != null ? String(row.border_reached_count) : '—'],
   ] : [];
@@ -158,20 +321,115 @@ export function TrialMiniStats({ row, metrics }: { row: TrialRow | null; metrics
     <div className="miniTrialStats">
       <div className="miniStatGrid">
         {stats.map(([label, value]) => (
-          <div key={label}><span>{label}</span><strong>{value}</strong></div>
+          <div key={label}>
+            <span>
+              {label}
+              {STAT_INFO[label] ? (
+                <span className="miniStatInfo" title={STAT_INFO[label]}>
+                  <Info size={10} />
+                </span>
+              ) : null}
+            </span>
+            <strong>{value}</strong>
+          </div>
         ))}
       </div>
-      {row?.got_lost ? <span className="warningBadge miniLostBadge">lost / disrupted attempt</span> : null}
+      {row?.got_lost ? (
+        <span className="warningBadge miniLostBadge">
+          lost / disrupted attempt{row.manual_lost !== null && row.manual_lost !== undefined ? ' (manual)' : ''}
+        </span>
+      ) : null}
+      {row?.excluded_from_stats ? (
+        <span className="warningBadge miniLostBadge" title="Flagged as a hardware error / bad trial — excluded from all General statistics totals">
+          excluded from statistics
+        </span>
+      ) : null}
       {row?.note ? <div className="miniWarning">{row.note}</div> : null}
     </div>
   );
 }
 
-export function ConditionTrajectoriesGrid({ sessions, patient, alpha, smoothTrajectory, smoothOnlySeeker, trialRows, bare = false }: Props) {
+interface AnnotationEditorProps {
+  patient: string;
+  condition: string;
+  pathId: string;
+  explorationSessionId: number | null;
+  manualLost: boolean | null;
+  comment: string;
+  excludedFromStats: boolean;
+  onSaved: (next: { manual_lost: boolean | null; comment: string; excluded_from_stats: boolean }) => void;
+}
+
+/** Per-trial researcher annotation: a manual lost/not-lost override (the
+ * automatic heuristic is a best-effort guess, hard to get right for every
+ * edge case), a hardware-error/exclude-from-stats flag, plus a free-text
+ * note. Saved to the backend on change/blur. */
+function TrialAnnotationEditor({ patient, condition, pathId, explorationSessionId, manualLost, comment, excludedFromStats, onSaved }: AnnotationEditorProps) {
+  const [localComment, setLocalComment] = useState(comment);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => { setLocalComment(comment); }, [comment, explorationSessionId]);
+
+  async function persist(nextManualLost: boolean | null, nextComment: string, nextExcluded: boolean) {
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await saveAnnotation({ patient, condition, pathId, explorationSessionId, manualLost: nextManualLost, comment: nextComment, excludedFromStats: nextExcluded });
+      onSaved({ manual_lost: nextManualLost, comment: nextComment, excluded_from_stats: nextExcluded });
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="miniAnnotation">
+      <select
+        value={manualLost === null ? 'auto' : manualLost ? 'lost' : 'ok'}
+        title="Override the automatically-detected lost/disrupted flag"
+        onChange={(e) => {
+          const v = e.target.value;
+          persist(v === 'auto' ? null : v === 'lost', localComment, excludedFromStats);
+        }}
+      >
+        <option value="auto">Auto-detected</option>
+        <option value="lost">Mark: lost</option>
+        <option value="ok">Mark: not lost</option>
+      </select>
+      <label className="inlineCheck miniExcludeCheck" title="Hardware error or otherwise bad trial — leave it visible here but drop it from every General statistics total">
+        <input
+          type="checkbox"
+          checked={excludedFromStats}
+          onChange={(e) => persist(manualLost, localComment, e.target.checked)}
+        />
+        Exclude from statistics
+      </label>
+      <textarea
+        className="miniCommentBox"
+        placeholder="Notes about this session…"
+        rows={2}
+        value={localComment}
+        onChange={(e) => setLocalComment(e.target.value)}
+        onBlur={() => { if (localComment !== comment) persist(manualLost, localComment, excludedFromStats); }}
+      />
+      {saving ? <span className="miniSavingHint">Saving…</span> : null}
+      {saveError ? <span className="miniSavingHint miniSavingError">{saveError}</span> : null}
+    </div>
+  );
+}
+
+export function ConditionTrajectoriesGrid({
+  sessions, patient, trialRows, bare = false, onAnnotationSaved,
+  showBorder, onShowBorder, showAnchors, onShowAnchors, showGrid, onShowGrid,
+  alpha, onAlpha, smoothTrajectory, onSmoothTrajectory, smoothOnlySeeker, onSmoothOnlySeeker,
+}: Props) {
   const [payloads, setPayloads] = useState<Map<number, SessionPayload>>(new Map());
   const [choices, setChoices] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [annotationOverrides, setAnnotationOverrides] = useState<Record<string, { manual_lost: boolean | null; comment: string; excluded_from_stats: boolean }>>({});
 
   // Smoothing settings (or patient) changing should drop the stale cache —
   // but every effect also fires once on mount, and setting a *new* empty
@@ -189,6 +447,7 @@ export function ConditionTrajectoriesGrid({ sessions, patient, alpha, smoothTraj
   useEffect(() => {
     if (!choicesMounted.current) { choicesMounted.current = true; return; }
     setChoices({});
+    setAnnotationOverrides({});
   }, [patient]);
 
   // condition → paths from the current patient's recordings (any status):
@@ -268,6 +527,43 @@ export function ConditionTrajectoriesGrid({ sessions, patient, alpha, smoothTraj
   const gridBody = (
     <div className="conditionGridBody">
       {error ? <div className="errorBox">{error}</div> : null}
+      <div className="miniGridToolbar">
+        <label className="inlineCheck">
+          <input type="checkbox" checked={showBorder} onChange={(e) => onShowBorder(e.target.checked)} />
+          Border 8×6 m
+        </label>
+        <label className="inlineCheck">
+          <input type="checkbox" checked={showAnchors} onChange={(e) => onShowAnchors(e.target.checked)} />
+          Anchors
+        </label>
+        <label className="inlineCheck">
+          <input type="checkbox" checked={showGrid} onChange={(e) => onShowGrid(e.target.checked)} />
+          Grid 1×1 m
+        </label>
+        <label className="inlineCheck">
+          <input type="checkbox" checked={smoothTrajectory} onChange={(e) => onSmoothTrajectory(e.target.checked)} />
+          Plot smoothing
+        </label>
+        {smoothTrajectory ? (
+          <>
+            <label className="inlineCheck">
+              <input type="checkbox" checked={smoothOnlySeeker} onChange={(e) => onSmoothOnlySeeker(e.target.checked)} />
+              Seeker P1 only
+            </label>
+            <label className="miniAlphaLabel">
+              α {alpha.toFixed(2)}
+              <input
+                type="range"
+                min="0.05"
+                max="1"
+                step="0.05"
+                value={alpha}
+                onChange={(e) => onAlpha(Number(e.target.value))}
+              />
+            </label>
+          </>
+        ) : null}
+      </div>
       <div className="miniTrajGrid">
           {cells.map((cell) => {
             const phasePayloads = cell.phases
@@ -285,6 +581,18 @@ export function ConditionTrajectoriesGrid({ sessions, patient, alpha, smoothTraj
             ) ?? null;
             const explorationMetrics = phasePayloads.find((p) => p.phase === 'exploration')?.payload.metrics ?? null;
 
+            const annKey = `${cell.condition}|${cell.path}|${explorationId ?? 'none'}`;
+            const override = annotationOverrides[annKey];
+            const effectiveManualLost = override ? override.manual_lost : (trialRow?.manual_lost ?? null);
+            const effectiveComment = override ? override.comment : (trialRow?.comment ?? '');
+            const effectiveExcluded = override ? override.excluded_from_stats : (trialRow?.excluded_from_stats ?? false);
+            const effectiveRow = trialRow ? {
+              ...trialRow,
+              manual_lost: effectiveManualLost,
+              got_lost: effectiveManualLost !== null ? effectiveManualLost : trialRow.got_lost,
+              excluded_from_stats: effectiveExcluded,
+            } : null;
+
             return (
               <div key={`${cell.condition}-${cell.path}`} className="miniTrajCard">
                 <div className="miniTrajTitle">
@@ -293,7 +601,7 @@ export function ConditionTrajectoriesGrid({ sessions, patient, alpha, smoothTraj
                 </div>
                 {anySession ? (
                   <>
-                    <MiniTrajectory payloads={phasePayloads} />
+                    <MiniTrajectory payloads={phasePayloads} showBorder={showBorder} showAnchors={showAnchors} showGrid={showGrid} />
                     <div className="miniTrajStatus">
                       {cell.phases.map((cp) => {
                         const id = chosenId(cell, cp);
@@ -330,7 +638,25 @@ export function ConditionTrajectoriesGrid({ sessions, patient, alpha, smoothTraj
                         );
                       })}
                     </div>
-                    <TrialMiniStats row={trialRow} metrics={explorationMetrics} />
+                    <TrialMiniStats row={effectiveRow} metrics={explorationMetrics} />
+                    <TrialAnnotationEditor
+                      patient={patient}
+                      condition={cell.condition}
+                      pathId={cell.path}
+                      explorationSessionId={explorationId}
+                      manualLost={effectiveManualLost}
+                      comment={effectiveComment}
+                      excludedFromStats={effectiveExcluded}
+                      onSaved={(next) => {
+                        setAnnotationOverrides((prev) => ({ ...prev, [annKey]: next }));
+                        onAnnotationSaved?.({
+                          condition: cell.condition,
+                          pathId: cell.path,
+                          explorationSessionId: explorationId,
+                          excludedFromStats: next.excluded_from_stats,
+                        });
+                      }}
+                    />
                   </>
                 ) : (
                   <div className="miniTrajEmpty">No session recorded for this condition/path.</div>

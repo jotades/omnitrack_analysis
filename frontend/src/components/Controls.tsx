@@ -1,10 +1,8 @@
 import { useState } from 'react';
 import type { SessionRow } from '../types';
-import type { AnalysisMode } from '../App';
 
 interface Props {
   sessions: SessionRow[];
-  mode: AnalysisMode;
   selectedPatient: string;
   selectedCondition: string;
   selectedPhase: string;
@@ -60,7 +58,6 @@ export function Controls(props: Props) {
     .sort((a, b) => `${a.path_id}-${a.phase}-${a.start_time}`.localeCompare(`${b.path_id}-${b.phase}-${b.start_time}`));
 
   const current = props.sessions.find((s) => s.session_id === props.selectedSessionId);
-  const isCompare = props.mode === 'compare';
 
   return (
     <>
@@ -98,7 +95,7 @@ export function Controls(props: Props) {
             </label>
 
             <label>
-              Phase{isCompare ? ' (ignored when comparing phases)' : ''}
+              Phase
               <select value={props.selectedPhase} onChange={(e) => props.onPhase(e.target.value)}>
                 {phases.map((p) => <option key={p} value={p}>{p}</option>)}
               </select>
@@ -111,49 +108,39 @@ export function Controls(props: Props) {
               </select>
             </label>
 
-            {!isCompare ? (
-              <label className="wide">
-                Session
-                <select
-                  value={props.selectedSessionId ?? ''}
-                  onChange={(e) => props.onSession(Number(e.target.value))}
-                >
-                  {sessionOptions.map((s) => (
-                    <option key={s.session_id} value={s.session_id}>
-                      {s.phase} | {s.path_id} | {s.start_time ?? 'no time'} | {s.n_raw ?? '?'} samples | {s.warning}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : null}
+            <label className="wide">
+              Session
+              <select
+                value={props.selectedSessionId ?? ''}
+                onChange={(e) => props.onSession(Number(e.target.value))}
+              >
+                {sessionOptions.map((s) => (
+                  <option key={s.session_id} value={s.session_id}>
+                    {s.phase} | {s.path_id} | {s.start_time ?? 'no time'} | {s.n_raw ?? '?'} samples | {s.warning}
+                  </option>
+                ))}
+              </select>
+            </label>
 
-            {!isCompare ? (
-              <label>
-                Plot smoothing α: {props.alpha.toFixed(2)}
-                <input
-                  type="range"
-                  min="0.05"
-                  max="1"
-                  step="0.05"
-                  value={props.alpha}
-                  onChange={(e) => props.onAlpha(Number(e.target.value))}
-                />
-              </label>
-            ) : null}
+            <label>
+              Plot smoothing α: {props.alpha.toFixed(2)}
+              <input
+                type="range"
+                min="0.05"
+                max="1"
+                step="0.05"
+                value={props.alpha}
+                onChange={(e) => props.onAlpha(Number(e.target.value))}
+              />
+            </label>
           </div>
 
-          {!isCompare ? (
-            <div className="toggleColumn">
-              <label><input type="checkbox" checked={props.smoothTrajectory} onChange={(e) => props.onSmoothTrajectory(e.target.checked)} /> Smooth 2D offline</label>
-              <label><input type="checkbox" checked={props.showCookedOverlay} onChange={(e) => props.onShowCookedOverlay(e.target.checked)} /> Cooked overlay α=0.4</label>
-              <label><input type="checkbox" checked={props.smoothOnlySeeker} onChange={(e) => props.onSmoothOnlySeeker(e.target.checked)} /> Smooth seeker P1 only</label>
-              <button type="button" onClick={props.onRefresh}>Refresh index</button>
-            </div>
-          ) : (
-            <div className="toggleColumn">
-              <button type="button" onClick={props.onRefresh}>Refresh index</button>
-            </div>
-          )}
+          <div className="toggleColumn">
+            <label><input type="checkbox" checked={props.smoothTrajectory} onChange={(e) => props.onSmoothTrajectory(e.target.checked)} /> Smooth 2D offline</label>
+            <label><input type="checkbox" checked={props.showCookedOverlay} onChange={(e) => props.onShowCookedOverlay(e.target.checked)} /> Cooked overlay α=0.4</label>
+            <label><input type="checkbox" checked={props.smoothOnlySeeker} onChange={(e) => props.onSmoothOnlySeeker(e.target.checked)} /> Smooth seeker P1 only</label>
+            <button type="button" onClick={props.onRefresh}>Refresh index</button>
+          </div>
         </section>
       </aside>
     </>

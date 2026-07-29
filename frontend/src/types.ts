@@ -177,6 +177,25 @@ export interface TrialTurn {
   wrong_turn: boolean;
 }
 
+export interface TargetDiscoveryEntry {
+  target_id: string;
+  /** Position of this target in the learning session's own intended visit order. */
+  path_order: number;
+  found: boolean;
+  first_feedback_t_s: number | null;
+  /** Closest proximity zone reached for this target (lower = closer). */
+  min_bucket: number | null;
+  max_intensity: number | null;
+}
+
+export interface TargetDiscovery {
+  targets: TargetDiscoveryEntry[];
+  found_count: number;
+  discovery_order: string[];
+  /** Whether the found targets were triggered in the same relative order as the intended path. */
+  in_order: boolean | null;
+}
+
 export interface TrialRow {
   patient: string;
   condition: string;
@@ -194,8 +213,28 @@ export interface TrialRow {
   mean_turn_deviation_deg: number | null;
   stop_position_distance_m: number | null;
   start_position_distance_m: number | null;
+  /** [x, y] of the learning trajectory's own end point — the "ideal" stop location. */
+  ideal_stop_xy: [number, number] | null;
+  /** [x, y] of the learning trajectory's own start point — the "ideal" start location. */
+  ideal_start_xy: [number, number] | null;
+  /** Distance between the learning start point and the exploration's LAST position —
+   * did they go out and come back? This is how "completed the path" is defined. */
+  return_to_start_distance_m: number | null;
+  target_discovery: TargetDiscovery | null;
+  /** target_id -> probable physical impact count during this exploration attempt. */
+  target_impacts: Record<string, number>;
   stop_count: number | null;
   border_reached_count: number | null;
+  manual_lost: boolean | null;
+  comment: string;
+  /** Hardware error / bad trial — excluded from all aggregate statistics. */
+  excluded_from_stats: boolean;
   note?: string;
   error?: string;
+}
+
+export interface PatientTrialSummary {
+  patient: string;
+  total_trials: number;
+  lost_trials: number;
 }

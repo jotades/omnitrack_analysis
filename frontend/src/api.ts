@@ -1,4 +1,4 @@
-import type { CompareRow, SessionPayload, SessionRow, TrialRow } from './types';
+import type { CompareRow, PatientTrialSummary, SessionPayload, SessionRow, TrialRow } from './types';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '';
 
@@ -70,4 +70,53 @@ export async function fetchTrialRows(opts: {
   params.set('include_suspicious', String(opts.includeSuspicious ?? true));
   const data = await getJson<{ rows: TrialRow[] }>(`/api/trials/compare?${params}`, { signal: opts.signal });
   return data.rows;
+}
+
+export async function fetchTrialsSummary(patients?: string[], signal?: AbortSignal): Promise<PatientTrialSummary[]> {
+  const params = new URLSearchParams();
+  patients?.forEach((p) => params.append('patients', p));
+  const data = await getJson<{ rows: PatientTrialSummary[] }>(`/api/trials/summary?${params}`, { signal });
+  return data.rows;
+}
+
+export async function fetchPatientInclusion(): Promise<Record<string, boolean>> {
+  const data = await getJson<{ inclusion: Record<string, boolean> }>('/api/patient-inclusion');
+  return data.inclusion;
+}
+
+export async function savePatientInclusion(patient: string, included: boolean): Promise<Record<string, boolean>> {
+  const res = await fetch(`${API_BASE}/api/patient-inclusion`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ patient, included }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.inclusion;
+}
+
+export async function saveAnnotation(payload: {
+  patient: string;
+  condition: string;
+  pathId: string;
+  explorationSessionId: number | null;
+  manualLost: boolean | null;
+  comment: string;
+  excludedFromStats?: boolean;
+}): Promise<{ manual_lost: boolean | null; comment: string; excluded_from_stats: boolean }> {
+  const res = await fetch(`${API_BASE}/api/annotations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      patient: payload.patient,
+      condition: payload.condition,
+      path_id: payload.pathId,
+      exploration_session_id: payload.explorationSessionId,
+      manual_lost: payload.manualLost,
+      comment: payload.comment,
+      excluded_from_stats: payload.excludedFromStats ?? false,
+    }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
 }

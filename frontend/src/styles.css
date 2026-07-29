@@ -427,8 +427,10 @@ button:hover { opacity: 0.9; }
   gap: 6px 10px;
 }
 .miniStatGrid div { display: flex; flex-direction: column; gap: 1px; }
-.miniStatGrid span { font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+.miniStatGrid span { font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; display: inline-flex; align-items: center; gap: 3px; }
 .miniStatGrid strong { font-size: 0.8rem; }
+.miniStatInfo { display: inline-flex; cursor: help; opacity: 0.6; }
+.miniStatInfo:hover { opacity: 1; }
 .miniLostBadge { margin-top: 8px; display: inline-flex; }
 
 .cardHeader {
@@ -568,6 +570,55 @@ button:hover { opacity: 0.9; }
 .collapseTitle small { color: var(--muted); font-size: 0.82rem; }
 
 .conditionGridBody { padding: 0 16px 16px; }
+
+/* Always-visible per-patient header extras: phase toggle, unified trial +
+   session tile grid, missing-conditions note — all visible without opening
+   the dropdown. */
+.patientHeaderExtra {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 20px 16px;
+}
+.missingConditionsNote {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-style: italic;
+}
+.patientHeaderControls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+}
+.sessionSetupBody { padding: 12px 20px 20px; }
+
+/* Always-visible trial + session totals on a patient's collapsed header —
+   one unified tile grid, compact, deliberately smaller than the full-size
+   Single Session metric tiles. */
+.patientHeaderStats {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(90px, 1fr));
+  gap: 8px;
+}
+.patientHeaderStat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+}
+.patientHeaderStat span { font-size: 0.66rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+.patientHeaderStat strong { font-size: 0.88rem; letter-spacing: -0.01em; }
+
+@media (max-width: 900px) {
+  .patientHeaderStats { grid-template-columns: repeat(3, minmax(90px, 1fr)); }
+}
+@media (max-width: 480px) {
+  .patientHeaderStats { grid-template-columns: repeat(2, minmax(90px, 1fr)); }
+}
 .miniTrajGrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
@@ -587,6 +638,7 @@ button:hover { opacity: 0.9; }
 .miniTrajTitle strong { font-size: 0.86rem; letter-spacing: -0.01em; }
 .miniTrajTitle span { color: var(--muted); font-size: 0.78rem; font-weight: 700; }
 .miniTrajSvg { width: 100%; height: auto; display: block; }
+.miniAnchorMarker { cursor: help; }
 .miniTrajStatus {
   display: flex;
   flex-wrap: wrap;
@@ -612,6 +664,33 @@ button:hover { opacity: 0.9; }
   min-height: 140px;
 }
 
+.miniGridToolbar { margin-bottom: 4px; }
+.miniAlphaLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+  color: var(--muted);
+  padding-bottom: 10px;
+}
+.miniAlphaLabel input[type="range"] { width: 90px; }
+.miniAnnotation { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.miniAnnotation select { font-size: 0.75rem; min-height: 26px; padding: 0 6px; align-self: flex-start; }
+.miniExcludeCheck { font-size: 0.75rem; padding-bottom: 0; }
+.miniCommentBox {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+.miniSavingHint { font-size: 0.72rem; color: var(--muted); }
+.miniSavingError { color: var(--bad-fg); }
+
 @media (max-width: 720px) {
   .miniTrajGrid { grid-template-columns: 1fr; }
 }
@@ -623,6 +702,34 @@ table { border-collapse: collapse; width: 100%; min-width: 850px; font-size: 0.8
 th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
 th { position: sticky; top: 0; background: var(--surface); z-index: 1; color: var(--muted); }
 td { color: var(--text); }
+
+.thresholdInput {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.thresholdInput input[type="number"] { width: 64px; min-height: 32px; padding: 2px 8px; }
+
+.behavioralSubgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  padding: 4px 20px 20px;
+}
+.behavioralSubcard {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px 16px;
+}
+.behavioralSubcard h3 { margin: 0 0 8px; font-size: 0.92rem; }
+.behavioralSubcard .miniHint { margin: 0 0 8px; }
+.miniTable { min-width: 0; font-size: 0.82rem; }
+.miniTable th, .miniTable td { padding: 6px 8px; }
+.miniTable th { position: static; background: none; }
 
 .errorBox {
   padding: 14px 16px;

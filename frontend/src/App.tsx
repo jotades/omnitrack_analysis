@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Footprints, GitCompareArrows, Moon, RefreshCw, Sun, User } from 'lucide-react';
-import { fetchSessionDetail, fetchSessions, fetchTrialRows, refreshIndex } from './api';
-import type { SessionPayload, SessionRow, TrialRow } from './types';
+import { BarChart3, Footprints, Moon, RefreshCw, Sun, User } from 'lucide-react';
+import {
+  fetchCompareRows,
+  fetchPatientInclusion,
+  fetchSessionDetail,
+  fetchSessions,
+  fetchTrialRows,
+  fetchTrialsSummary,
+  refreshIndex,
+} from './api';
+import type { CompareRow, PatientTrialSummary, SessionPayload, SessionRow, TrialRow } from './types';
 import { Controls } from './components/Controls';
-import { PatientSummaryCards } from './components/PatientSummaryCards';
+import { SessionSetupCard } from './components/SessionSetupCard';
 import { QualityIndicators } from './components/QualityIndicators';
 import { PlaybackControls } from './components/PlaybackControls';
 import { Trajectory2D } from './components/Trajectory2D';
@@ -17,12 +25,12 @@ import {
   OrientationAnglesChart,
   SpeedChart,
 } from './components/TimeSeriesCharts';
-import { ComparisonPanel } from './components/ComparisonPanel';
 import { TrialsPanel } from './components/TrialsPanel';
+import { GeneralStatisticsPanel } from './components/GeneralStatisticsPanel';
 import { ProfilesTable, SessionStatusTable } from './components/SessionTables';
 import './styles.css';
 
-export type AnalysisMode = 'single' | 'compare' | 'trials';
+export type AnalysisMode = 'single' | 'trials' | 'general';
 type Theme = 'light' | 'dark';
 
 function firstOrEmpty(values: string[]) {
@@ -153,6 +161,70 @@ export default function App() {
       setSelectedPath(validPaths[0]);
     }
   }, [sessions, selectedPatient, selectedCondition, selectedPhase, selectedPath]);
+
+  // ---------------------------------------------------------------------
+  // Bulk data shared by the Trial metrics and General statistics tabs —
+  // fetched once here (not inside either tab) so switching tabs doesn't
+  // re-trigger the slow (tens of seconds) bulk trial-trajectory computation.
+  // ---------------------------------------------------------------------
+  const allPatients = useMemo(() => uniq(sessions.map((s) => s.patient)), [sessions]);
+
+  const [patientSummaries, setPatientSummaries] = useState<PatientTrialSummary[]>([]);
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchTrialsSummary(undefined, controller.signal).then(setPatientSummaries).catch(() => {});
+    return () => controller.abort();
+  }, []);
+  // Manual lost/not-lost annotations change this count server-side, but the
+  // fetch above only runs once on mount — refresh it after every save so the
+  // "N/M trials lost" badge doesn't go stale.
+  const refreshPatientSummaries = useCallback(() => {
+    fetchTrialsSummary().then(setPatientSummaries).catch(() => {});
+  }, []);
+
+  const [bulkSessionRows, setBulkSessionRows] = useState<CompareRow[]>([]);
+  const [bulkSessionRowsLoaded, setBulkSessionRowsLoaded] = useState(false);
+  useEffect(() => {
+    if (!allPatients.length) { setBulkSessionRows([]); return; }
+    let cancelled = false;
+    fetchCompareRows({ patients: allPatients, phase: 'all', includeSuspicious: true })
+      .then((rows) => { if (!cancelled) { setBulkSessionRows(rows); setBulkSessionRowsLoaded(true); } })
+      .catch(() => { if (!cancelled) setBulkSessionRowsLoaded(true); });
+    return () => { cancelled = true; };
+  }, [allPatients]);
+
+  const [bulkTrialRows, setBulkTrialRows] = useState<TrialRow[]>([]);
+  const [bulkTrialRowsLoaded, setBulkTrialRowsLoaded] = useState(false);
+  useEffect(() => {
+    if (!allPatients.length) { setBulkTrialRows([]); return; }
+    let cancelled = false;
+    fetchTrialRows({ includeSuspicious: true })
+      .then((rowsResult) => { if (!cancelled) { setBulkTrialRows(rowsResult); setBulkTrialRowsLoaded(true); } })
+      .catch(() => { if (!cancelled) setBulkTrialRowsLoaded(true); });
+    return () => { cancelled = true; };
+  }, [allPatients]);
+
+  const bulkDataLoading = !bulkSessionRowsLoaded || !bulkTrialRowsLoaded;
+
+  // Per-patient opt-out from General statistics, persisted on the backend —
+  // the save call itself lives in TrialsPanel (next to the checkbox), this
+  // just keeps the shared in-memory map in sync for GeneralStatisticsPanel.
+  const [inclusion, setInclusionState] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    fetchPatientInclusion().then(setInclusionState).catch(() => {});
+  }, []);
+  const setInclusion = useCallback((patient: string, included: boolean) => {
+    setInclusionState((prev) => ({ ...prev, [patient]: included }));
+  }, []);
+
+  // Per-trial "exclude from statistics" (hardware error / bad trial) — same
+  // save-instantly, apply-on-top-of-last-fetch pattern as inclusion above,
+  // keyed per attempt so the underlying annotation save (in TrialsPanel) and
+  // this shared override map agree on which attempt was flagged.
+  const [excludedTrialOverrides, setExcludedTrialOverrides] = useState<Record<string, boolean>>({});
+  const setTrialExcluded = useCallback((patient: string, condition: string, pathId: string, explorationSessionId: number | null, excluded: boolean) => {
+    setExcludedTrialOverrides((prev) => ({ ...prev, [`${patient}|${condition}|${pathId}|${explorationSessionId ?? 'none'}`]: excluded }));
+  }, []);
 
   const filteredSessions = useMemo(() => {
     return sortSessions(
@@ -385,19 +457,6 @@ export default function App() {
         <button
           type="button"
           role="tab"
-          aria-selected={analysisMode === 'compare'}
-          className={analysisMode === 'compare' ? 'active' : ''}
-          onClick={() => setAnalysisMode('compare')}
-        >
-          <GitCompareArrows size={16} />
-          <span>
-            <strong>Comparison mode</strong>
-            <small>Aggregate metrics across phases or across patients</small>
-          </span>
-        </button>
-        <button
-          type="button"
-          role="tab"
           aria-selected={analysisMode === 'trials'}
           className={analysisMode === 'trials' ? 'active' : ''}
           onClick={() => setAnalysisMode('trials')}
@@ -408,12 +467,24 @@ export default function App() {
             <small>Exploration vs. learning: overlap, turns, stops, border, lost trials</small>
           </span>
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={analysisMode === 'general'}
+          className={analysisMode === 'general' ? 'active' : ''}
+          onClick={() => setAnalysisMode('general')}
+        >
+          <BarChart3 size={16} />
+          <span>
+            <strong>General statistics</strong>
+            <small>Combined totals across every included patient</small>
+          </span>
+        </button>
       </div>
 
       {analysisMode === 'single' ? (
         <Controls
           sessions={sessions}
-          mode={analysisMode}
           selectedPatient={selectedPatient}
           selectedCondition={selectedCondition}
           selectedPhase={selectedPhase}
@@ -436,26 +507,37 @@ export default function App() {
         />
       ) : null}
 
-      {analysisMode === 'compare' ? (
-        <ComparisonPanel sessions={sessions} />
-      ) : analysisMode === 'trials' ? (
-        <TrialsPanel sessions={sessions} />
+      {analysisMode === 'trials' ? (
+        <TrialsPanel
+          sessions={sessions}
+          sessionRows={bulkSessionRows}
+          allTrialRows={bulkTrialRows}
+          patientSummaries={patientSummaries}
+          dataLoading={bulkDataLoading}
+          onRefreshPatientSummaries={refreshPatientSummaries}
+          inclusion={inclusion}
+          onSetInclusion={setInclusion}
+          excludedTrialOverrides={excludedTrialOverrides}
+          onSetTrialExcluded={setTrialExcluded}
+        />
+      ) : analysisMode === 'general' ? (
+        <GeneralStatisticsPanel
+          sessions={sessions}
+          sessionRows={bulkSessionRows}
+          trialRows={bulkTrialRows}
+          patientSummaries={patientSummaries}
+          inclusion={inclusion}
+          dataLoading={bulkDataLoading}
+          excludedTrialOverrides={excludedTrialOverrides}
+        />
       ) : (
         <>
-          {currentSession ? (
-            <section className="sessionBanner">
-              <div>
-                <strong>{currentSession.patient}</strong> / {currentSession.phase} / {currentSession.condition_label} / {currentSession.path_id}
-              </div>
-              <span>{currentSession.warning}</span>
-            </section>
-          ) : null}
+          <SessionSetupCard session={currentSession} payload={payload} />
 
           {detailLoading ? <div className="loading inlineLoading"><RefreshCw className="spin" /> Updating charts...</div> : null}
           {phaseOverlayLoading ? <div className="loading inlineLoading"><RefreshCw className="spin" /> Loading learning/exploration overlay...</div> : null}
 
           {payload ? <QualityIndicators payload={payload} /> : null}
-          {selectedPatient ? <PatientSummaryCards patient={selectedPatient} /> : null}
 
           {payload ? (
             <PlaybackControls
