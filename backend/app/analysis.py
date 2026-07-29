@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from .annotations import annotation_key, get_annotation, load_annotations
 from .settings import get_settings
 
 settings = get_settings()
@@ -1093,6 +1094,51 @@ def build_trials_df() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def compute_target_discovery(feedback_df: pd.DataFrame, target_ids_in_order: List[str]) -> Dict[str, Any]:
+    """Which of the trial's targets got any feedback during exploration ("found"
+    = made it sound/vibrate at all, not just reaching the closest zone), in what
+    order, and whether that order matches the learning session's own intended
+    visit order (target_ids_in_order = the raw session's hider_sequence_id)."""
+    targets_out: List[Dict[str, Any]] = []
+    discovered: List[Tuple[str, float]] = []
+    empty_df = feedback_df.iloc[0:0] if feedback_df is not None else pd.DataFrame()
+    for idx, tid in enumerate(target_ids_in_order):
+        rows = feedback_df[feedback_df["target_id"] == tid] if feedback_df is not None and not feedback_df.empty else empty_df
+        found = not rows.empty
+        first_t = float(rows["t_s"].min()) if found and "t_s" in rows else None
+        min_bucket = int(rows["bucket"].min()) if found and "bucket" in rows and rows["bucket"].notna().any() else None
+        max_intensity = float(rows["intensity"].max()) if found and "intensity" in rows and rows["intensity"].notna().any() else None
+        targets_out.append({
+            "target_id": tid, "path_order": idx, "found": found,
+            "first_feedback_t_s": first_t, "min_bucket": min_bucket, "max_intensity": max_intensity,
+        })
+        if found and first_t is not None:
+            discovered.append((tid, first_t))
+    discovered.sort(key=lambda x: x[1])
+    discovery_order = [d[0] for d in discovered]
+    # Relative order check so partial finds (e.g. only 2 of 3) are still well-defined:
+    # compare against the intended order restricted to only the targets actually found.
+    expected_relative_order = [t for t in target_ids_in_order if t in discovery_order]
+    return {
+        "targets": targets_out,
+        "found_count": len(discovery_order),
+        "discovery_order": discovery_order,
+        "in_order": (discovery_order == expected_relative_order) if discovery_order else None,
+    }
+
+
+def compute_target_impacts(tracking_df: pd.DataFrame, seeker_id: str, target_ids: List[str]) -> Dict[str, int]:
+    """Number of probable physical hits per target tag (reuses the impact
+    detection already used for IMU quality — a target sensor spiking above its
+    stationary baseline means the participant knocked into it)."""
+    imu = compute_imu_quality(tracking_df, seeker_id, target_ids)
+    counts: Dict[str, int] = {}
+    for ev in imu.get("events", []):
+        if ev.get("tag_id") in target_ids:
+            counts[ev["tag_id"]] = counts.get(ev["tag_id"], 0) + 1
+    return counts
+
+
 def compute_trial_metrics(learning_session_id: Optional[int], exploration_session_id: Optional[int]) -> Dict[str, Any]:
     """Compare an exploration trajectory against its trial's learning trajectory:
     route overlap, turn-by-turn deviation, and stop/start position drift."""
@@ -1100,6 +1146,8 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
         "overlap_pct": None, "mean_deviation_m": None,
         "turns": [], "wrong_turns_count": None, "mean_turn_deviation_deg": None,
         "stop_position_distance_m": None, "start_position_distance_m": None,
+        "ideal_stop_xy": None, "ideal_start_xy": None,
+        "return_to_start_distance_m": None, "target_discovery": None, "target_impacts": {},
     }
     if learning_session_id is None or exploration_session_id is None:
         return {**empty, "note": "missing learning or exploration session for this trial"}
@@ -1112,10 +1160,16 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
     learn_config = extract_config(learn_data)
     exp_config = extract_config(exp_data)
 
+    exp_tracking_df = session_to_tracking_df(exp_data)
     learn_xy = p1_xy(session_to_tracking_df(learn_data), learn_config["seeker_id"])
-    exp_xy = p1_xy(session_to_tracking_df(exp_data), exp_config["seeker_id"])
+    exp_xy = p1_xy(exp_tracking_df, exp_config["seeker_id"])
     if learn_xy.empty or exp_xy.empty:
         return {**empty, "note": "empty trajectory for learning or exploration session"}
+
+    # Intended visit order comes from the learning session's own hider_sequence_id
+    # (what the exploration is being checked against), not the exploration's.
+    target_discovery = compute_target_discovery(session_to_feedback_df(exp_data), learn_config["target_ids"])
+    target_impacts = compute_target_impacts(exp_tracking_df, exp_config["seeker_id"], exp_config["target_ids"])
 
     lx, ly = learn_xy["x"].to_numpy(), learn_xy["y"].to_numpy()
     ex, ey = exp_xy["x"].to_numpy(), exp_xy["y"].to_numpy()
@@ -1155,12 +1209,20 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
         "turns": turn_results,
         "wrong_turns_count": sum(1 for t in turn_results if t["wrong_turn"]),
         "mean_turn_deviation_deg": float(np.mean(deviations)) if deviations else None,
-        # Stopping position: how far the exploration end point is from where the
-        # participant stopped during learning.
+        # Stop position: how far the exploration's end point is from the learning
+        # trajectory's own end point (the "ideal" stop location).
         "stop_position_distance_m": float(math.hypot(lx[-1] - ex[-1], ly[-1] - ey[-1])),
-        # "Estimated start" at the end of the trial: exploration's own end point,
-        # compared against the learning phase's *start* position (per protocol).
-        "start_position_distance_m": float(math.hypot(lx[0] - ex[-1], ly[0] - ey[-1])),
+        # Start position: how far the exploration's start point is from the
+        # learning trajectory's own start point (the "ideal" start location).
+        "start_position_distance_m": float(math.hypot(lx[0] - ex[0], ly[0] - ey[0])),
+        "ideal_stop_xy": [float(lx[-1]), float(ly[-1])],
+        "ideal_start_xy": [float(lx[0]), float(ly[0])],
+        # "Returned to start": how far the exploration's END point is from the
+        # learning trajectory's START point — did they go out and come back?
+        # (Reuses ideal_start_xy as the same "ideal" point for this metric too.)
+        "return_to_start_distance_m": float(math.hypot(lx[0] - ex[-1], ly[0] - ey[-1])),
+        "target_discovery": target_discovery,
+        "target_impacts": target_impacts,
     }
 
 
@@ -1204,6 +1266,10 @@ def compare_trials(
             "total_attempts": _jsonable(r["total_attempts"]),
             "got_lost": bool(r["trial_got_lost"]),
         }
+        annotation = get_annotation(r["patient"], r["condition"], r["path_id"], exploration_id)
+        row_out["manual_lost"] = annotation.get("manual_lost")
+        row_out["comment"] = annotation.get("comment") or ""
+        row_out["excluded_from_stats"] = bool(annotation.get("excluded_from_stats", False))
         try:
             metrics = load_trial_metrics(learning_id, exploration_id)
             row_out.update({k: (v if k == "turns" else _jsonable(v)) for k, v in metrics.items()})
@@ -1224,3 +1290,34 @@ def compare_trials(
             row_out["error"] = str(exc)
         results.append(row_out)
     return results
+
+
+def trials_summary_by_patient(patients: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Cheap per-patient trial counts (no trajectory computation, just session
+    metadata + any manual annotations) — safe to fetch eagerly for every
+    patient, e.g. to show "N/M trials lost" on a collapsed dropdown header."""
+    trials_df = build_trials_df()
+    if trials_df.empty:
+        return []
+    df = trials_df.copy()
+    if patients:
+        df = df[df["patient"].isin(patients)]
+
+    annotations = load_annotations()
+    results: List[Dict[str, Any]] = []
+    for patient, g in df.groupby("patient"):
+        total = 0
+        lost = 0
+        for (condition, path_id), gg in g.groupby(["condition", "path_id"]):
+            last = gg.iloc[-1]  # most recent attempt (rows are already chronological)
+            exploration_id = int(last["exploration_session_id"]) if pd.notna(last["exploration_session_id"]) else None
+            ann = annotations.get(annotation_key(patient, condition, path_id, exploration_id))
+            if ann and ann.get("excluded_from_stats"):
+                continue  # hardware error / bad trial — don't count it at all
+            total += 1
+            manual_lost = ann.get("manual_lost") if ann else None
+            effective_lost = manual_lost if manual_lost is not None else bool(last["trial_got_lost"])
+            if effective_lost:
+                lost += 1
+        results.append({"patient": patient, "total_trials": total, "lost_trials": lost})
+    return sorted(results, key=lambda r: r["patient"])

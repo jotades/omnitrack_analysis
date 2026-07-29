@@ -4,6 +4,7 @@ from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from .analysis import (
     clear_caches,
@@ -12,7 +13,10 @@ from .analysis import (
     df_records,
     get_sessions_df,
     load_session_payload,
+    trials_summary_by_patient,
 )
+from .annotations import save_annotation
+from .inclusion import load_inclusion, save_inclusion
 from .settings import get_settings
 
 settings = get_settings()
@@ -160,5 +164,60 @@ def trials_compare(
             include_suspicious=include_suspicious,
         )
         return {"rows": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/trials/summary")
+def trials_summary(patients: Optional[List[str]] = Query(None)):
+    try:
+        return {"rows": trials_summary_by_patient(patients=patients)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+class AnnotationIn(BaseModel):
+    patient: str
+    condition: str
+    path_id: str
+    exploration_session_id: Optional[int] = None
+    manual_lost: Optional[bool] = None
+    comment: str = ""
+    excluded_from_stats: bool = False
+
+
+@app.post("/api/annotations")
+def upsert_annotation(payload: AnnotationIn):
+    try:
+        return save_annotation(
+            payload.patient,
+            payload.condition,
+            payload.path_id,
+            payload.exploration_session_id,
+            payload.manual_lost,
+            payload.comment,
+            payload.excluded_from_stats,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/patient-inclusion")
+def patient_inclusion():
+    try:
+        return {"inclusion": load_inclusion()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+class PatientInclusionIn(BaseModel):
+    patient: str
+    included: bool
+
+
+@app.post("/api/patient-inclusion")
+def upsert_patient_inclusion(payload: PatientInclusionIn):
+    try:
+        return {"inclusion": save_inclusion(payload.patient, payload.included)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

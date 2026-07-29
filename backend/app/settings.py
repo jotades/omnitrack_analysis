@@ -39,6 +39,22 @@ class Settings(BaseModel):
     turn_min_separation_m: float = 1.0
     turn_resample_step_m: float = 0.15
 
+    # Researcher annotations (manual "lost" override + free-text comment per
+    # trial attempt) — kept as a small JSON file next to the backend code,
+    # separate from DATA_DIR since it's app state, not raw session data.
+    annotations_path: Path = Path(os.getenv(
+        "ANNOTATIONS_PATH",
+        str(Path(__file__).resolve().parent / "trial_annotations.json"),
+    ))
+
+    # Per-patient opt-out from the General statistics aggregate — same
+    # small-JSON-file pattern as annotations_path above. Patients default to
+    # included (True) when absent from the file.
+    patient_inclusion_path: Path = Path(os.getenv(
+        "PATIENT_INCLUSION_PATH",
+        str(Path(__file__).resolve().parent / "patient_inclusion.json"),
+    ))
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
