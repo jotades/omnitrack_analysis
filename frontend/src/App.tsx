@@ -507,7 +507,12 @@ export default function App() {
         />
       ) : null}
 
-      {analysisMode === 'trials' ? (
+      {/* Always mounted (just hidden) rather than swapped in/out with the other
+          tabs — both are pure presentational components over the bulk data
+          fetched in App, so this costs nothing extra, and it means switching
+          Trials <-> General <-> Single no longer resets which pp_XX dropdowns
+          are open or the trajectory data already loaded inside them. */}
+      <div className={analysisMode === 'trials' ? undefined : 'hiddenPanel'}>
         <TrialsPanel
           sessions={sessions}
           sessionRows={bulkSessionRows}
@@ -520,7 +525,8 @@ export default function App() {
           excludedTrialOverrides={excludedTrialOverrides}
           onSetTrialExcluded={setTrialExcluded}
         />
-      ) : analysisMode === 'general' ? (
+      </div>
+      <div className={analysisMode === 'general' ? undefined : 'hiddenPanel'}>
         <GeneralStatisticsPanel
           sessions={sessions}
           sessionRows={bulkSessionRows}
@@ -530,7 +536,8 @@ export default function App() {
           dataLoading={bulkDataLoading}
           excludedTrialOverrides={excludedTrialOverrides}
         />
-      ) : (
+      </div>
+      {analysisMode === 'single' ? (
         <>
           <SessionSetupCard session={currentSession} payload={payload} />
 
@@ -599,7 +606,7 @@ export default function App() {
             <SessionStatusTable sessions={sessions} />
           </section>
         </>
-      )}
+      ) : null}
     </main>
   );
 }

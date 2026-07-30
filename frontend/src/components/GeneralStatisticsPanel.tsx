@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react';
 import {
-  AlertTriangle, Crosshair, Footprints, Gauge, ListChecks, PauseCircle, Radio, RefreshCw, Route, RotateCw, ShieldAlert, Timer, Users, Zap,
+  AlertTriangle, Crosshair, Footprints, Gauge, Info, ListChecks, PauseCircle, Radio, RefreshCw, Route, RotateCw, ShieldAlert, Timer, Users, Zap,
 } from 'lucide-react';
-import type { CompareRow, PatientTrialSummary, SessionRow, TrialRow } from '../types';
+import type { CompareRow, PatientTrialSummary, SessionRow, TargetDiscovery, TrialRow } from '../types';
 import { avgBy, fmtNum, maxBy, sumBy } from '../lib/aggregate';
 
 interface Props {
@@ -108,43 +108,87 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
 
   const completed = (r: TrialRow) => r.return_to_start_distance_m != null && r.return_to_start_distance_m <= returnThreshold;
 
+  // Per-PATIENT outcome classification — every included patient lands in
+  // exactly one bucket: the outcome they reached most often (the mode)
+  // across their own trials, so the buckets always sum to the total number
+  // of classifiable patients. This priority order both defines each trial's
+  // category and breaks ties when a patient split evenly between two modes
+  // (the better-ranked one wins): found more targets > in the
+  // learning-taught order > completed (returned within the threshold).
+  const OUTCOME_CATEGORIES: Array<{
+    key: 'found3InOrderCompleted' | 'found3InOrderNotCompleted' | 'found3OutOfOrderCompleted' | 'found3OutOfOrderNotCompleted'
+      | 'found2Completed' | 'found2NotCompleted' | 'found1Completed' | 'found1NotCompleted' | 'found0Completed' | 'found0NotCompleted';
+    label: string;
+    test: (td: TargetDiscovery, isCompleted: boolean) => boolean;
+  }> = [
+    { key: 'found3InOrderCompleted', label: 'Found 3, in order & completed', test: (td, c) => td.found_count === 3 && td.in_order === true && c },
+    { key: 'found3InOrderNotCompleted', label: 'Found 3, in order & not completed', test: (td, c) => td.found_count === 3 && td.in_order === true && !c },
+    { key: 'found3OutOfOrderCompleted', label: 'Found 3, out of order & completed', test: (td, c) => td.found_count === 3 && td.in_order === false && c },
+    { key: 'found3OutOfOrderNotCompleted', label: 'Found 3, out of order & not completed', test: (td, c) => td.found_count === 3 && td.in_order === false && !c },
+    { key: 'found2Completed', label: 'Found 2 & completed', test: (td, c) => td.found_count === 2 && c },
+    { key: 'found2NotCompleted', label: 'Found 2 & not completed', test: (td, c) => td.found_count === 2 && !c },
+    { key: 'found1Completed', label: 'Found 1 & completed', test: (td, c) => td.found_count === 1 && c },
+    { key: 'found1NotCompleted', label: 'Found 1 & not completed', test: (td, c) => td.found_count === 1 && !c },
+    { key: 'found0Completed', label: 'Found 0 & completed', test: (td, c) => td.found_count === 0 && c },
+    { key: 'found0NotCompleted', label: 'Found 0 & not completed', test: (td, c) => td.found_count === 0 && !c },
+  ];
+
   const discoveryBreakdown = useMemo(() => {
-    let all3InOrder = 0;
-    let found2Completed = 0, found2NotCompleted = 0;
-    let found1Completed = 0, found1NotCompleted = 0;
-    let found0 = 0;
-    let outOfOrder = 0;
+    const trialsByPatient = new Map<string, TrialRow[]>();
     for (const r of validTrialRows) {
-      const td = r.target_discovery;
-      if (!td) continue;
-      const isCompleted = completed(r);
-      if (td.found_count > 0 && td.in_order === false) outOfOrder += 1;
-      if (td.found_count === 3 && td.in_order) all3InOrder += 1;
-      else if (td.found_count === 2) { if (isCompleted) found2Completed += 1; else found2NotCompleted += 1; }
-      else if (td.found_count === 1) { if (isCompleted) found1Completed += 1; else found1NotCompleted += 1; }
-      else if (td.found_count === 0) found0 += 1;
+      if (!r.target_discovery) continue;
+      const arr = trialsByPatient.get(r.patient) ?? [];
+      arr.push(r);
+      trialsByPatient.set(r.patient, arr);
     }
-    return { all3InOrder, found2Completed, found2NotCompleted, found1Completed, found1NotCompleted, found0, outOfOrder };
+    const counts = Object.fromEntries(OUTCOME_CATEGORIES.map((c) => [c.key, 0])) as Record<string, number>;
+    for (const [, rows] of trialsByPatient) {
+      // Tally every trial into its category, then take the MODE (the
+      // category this patient landed in most often across all their
+      // trials) — a "best ever" pick made almost everyone show up under
+      // "found 3" since most patients succeed at least once out of ~8
+      // attempts, hiding that most of their individual trials don't.
+      // Ties go to the better-ranked category (OUTCOME_CATEGORIES order).
+      const tally = new Map<string, number>();
+      for (const r of rows) {
+        const isCompleted = completed(r);
+        for (const cat of OUTCOME_CATEGORIES) {
+          if (cat.test(r.target_discovery!, isCompleted)) {
+            tally.set(cat.key, (tally.get(cat.key) ?? 0) + 1);
+            break; // each trial belongs to exactly one category
+          }
+        }
+      }
+      let modeKey: string | null = null;
+      let modeCount = -1;
+      for (const cat of OUTCOME_CATEGORIES) {
+        const n = tally.get(cat.key) ?? 0;
+        if (n > modeCount) { modeCount = n; modeKey = cat.key; }
+      }
+      if (modeKey) counts[modeKey] += 1;
+    }
+    return { counts, classifiedPatients: trialsByPatient.size };
   }, [validTrialRows, returnThreshold]);
 
   const impactBreakdown = useMemo(() => {
-    let trialsWithImpact = 0;
+    const patientsWithImpact = new Set<string>();
     const perTarget: Record<string, number> = {};
     for (const r of validTrialRows) {
       const values = Object.values(r.target_impacts ?? {});
-      if (values.some((v) => v > 0)) trialsWithImpact += 1;
+      if (values.some((v) => v > 0)) patientsWithImpact.add(r.patient);
       for (const [tid, count] of Object.entries(r.target_impacts ?? {})) {
         perTarget[tid] = (perTarget[tid] ?? 0) + count;
       }
     }
-    return { trialsWithImpact, perTarget };
+    return { patientsWithImpact: patientsWithImpact.size, perTarget };
   }, [validTrialRows]);
 
   const conditionBreakdown = useMemo(() => {
-    const byCondition = new Map<string, { label: string; total: number; foundAll: number }>();
+    const byCondition = new Map<string, { label: string; total: number; foundAll: number; patients: Set<string> }>();
     for (const r of validTrialRows) {
-      const entry = byCondition.get(r.condition) ?? { label: r.condition_label || r.condition, total: 0, foundAll: 0 };
+      const entry = byCondition.get(r.condition) ?? { label: r.condition_label || r.condition, total: 0, foundAll: 0, patients: new Set<string>() };
       entry.total += 1;
+      entry.patients.add(r.patient);
       if (r.target_discovery?.found_count === (r.target_discovery?.targets.length ?? -1) && (r.target_discovery?.targets.length ?? 0) > 0) {
         entry.foundAll += 1;
       }
@@ -156,7 +200,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
     return Array.from(byCondition.entries())
       .filter(([condition]) => condition != null)
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([condition, v]) => ({ condition, ...v }));
+      .map(([condition, v]) => ({ condition, ...v, patientCount: v.patients.size }));
   }, [validTrialRows]);
 
   const proximityBreakdown = useMemo(() => {
@@ -200,6 +244,13 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
     });
   }, [includedSessionRows, includedAttempts, returnThreshold]);
 
+  // Denominators shown as "N patients · M trials/attempts" context lines —
+  // computed once here since several sections below (and the sections above)
+  // share the same validTrialRows pool.
+  const behavioralPatientCount = useMemo(() => new Set(validTrialRows.map((r) => r.patient)).size, [validTrialRows]);
+  const explorationAttempts = useMemo(() => includedSessionRows.filter((r) => r.phase === 'exploration' && r.duration_s != null), [includedSessionRows]);
+  const explorationAttemptPatientCount = useMemo(() => new Set(explorationAttempts.map((r) => r.patient)).size, [explorationAttempts]);
+
   return (
     <>
       <section className="card comparisonControls">
@@ -235,7 +286,11 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
 
       <section className="card">
         <div className="cardHeader">
-          <div><h2>Trial totals</h2><p>Learning-vs-exploration trial metrics, deduplicated to one entry per distinct condition × path trial (latest non-excluded attempt).</p></div>
+          <div>
+            <h2>Trial totals</h2>
+            <p>Learning-vs-exploration trial metrics, deduplicated to one entry per distinct condition × path trial (latest non-excluded attempt).</p>
+            <p className="sectionCount">{behavioralPatientCount} patients · {validTrialRows.length} trials</p>
+          </div>
         </div>
         <div className="metricGrid">
           {trialItems.map((item) => {
@@ -256,6 +311,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
           <div>
             <h2>Behavioral breakdown</h2>
             <p>Target discovery, completion, impacts and speed, all computed over the same deduplicated valid trials above.</p>
+            <p className="sectionCount">{behavioralPatientCount} patients · {validTrialRows.length} trials</p>
           </div>
           <label className="thresholdInput" title="A trial counts as 'completed' when the exploration's last position is within this distance of the learning session's start point.">
             Return-to-start threshold
@@ -270,25 +326,69 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
           </label>
         </div>
 
-        <div className="metricGrid">
-          <div className="metricCard"><span>Found all 3, in order &amp; completed</span><strong>{discoveryBreakdown.all3InOrder}</strong></div>
-          <div className="metricCard"><span>Found 2/3 — completed</span><strong>{discoveryBreakdown.found2Completed}</strong></div>
-          <div className="metricCard"><span>Found 2/3 — not completed</span><strong>{discoveryBreakdown.found2NotCompleted}</strong></div>
-          <div className="metricCard"><span>Found 1/3 — completed</span><strong>{discoveryBreakdown.found1Completed}</strong></div>
-          <div className="metricCard"><span>Found 1/3 — not completed</span><strong>{discoveryBreakdown.found1NotCompleted}</strong></div>
-          <div className="metricCard"><span>Found 0/3</span><strong>{discoveryBreakdown.found0}</strong></div>
-          <div className="metricCard"><span>Found out of order</span><strong>{discoveryBreakdown.outOfOrder}</strong></div>
-          <div className="metricCard"><span>Trials with ≥1 object impact</span><strong>{impactBreakdown.trialsWithImpact}</strong></div>
+        <p className="miniHint" style={{ padding: '0 20px' }}>
+          Number of PATIENTS (never trials) — each patient counted exactly once, in whichever outcome they landed in
+          <strong> most often</strong> across their own trials (the mode, not their single best attempt — see{' '}
+          <span className="miniStatInfo" title={
+            "Why the mode, not the best trial: with ~8 trials each, almost every patient succeeds at finding all 3 targets "
+            + "at least once — a 'best ever' summary would put nearly everyone under 'Found 3', hiding that most of an "
+            + "individual patient's trials may not find everything (e.g. one patient's real trials were "
+            + "[2, 3, 1, 1, 1, 0] targets found — only 1 of 6 attempts found all 3, so they land under 'Found 1', "
+            + "not 'Found 3'). Ties between categories are broken in favor of the better outcome."
+          }>
+            <Info size={12} />
+          </span>). The categories below always sum to{' '}
+          <strong>{discoveryBreakdown.classifiedPatients}</strong>, the number of patients with at least one comparable trial
+          (out of {behavioralPatientCount} total valid patients — the rest have no trial with both learning and exploration data to compare).
+        </p>
+
+        <div className="outcomeGroup">
+          <h4>Found all 3 targets</h4>
+          <div className="metricGrid">
+            <div className="metricCard"><span>In order &amp; completed</span><strong>{discoveryBreakdown.counts.found3InOrderCompleted}</strong></div>
+            <div className="metricCard"><span>In order &amp; not completed</span><strong>{discoveryBreakdown.counts.found3InOrderNotCompleted}</strong></div>
+            <div className="metricCard"><span>Out of order &amp; completed</span><strong>{discoveryBreakdown.counts.found3OutOfOrderCompleted}</strong></div>
+            <div className="metricCard"><span>Out of order &amp; not completed</span><strong>{discoveryBreakdown.counts.found3OutOfOrderNotCompleted}</strong></div>
+          </div>
+        </div>
+        <div className="outcomeGroup">
+          <h4>Found 2 of 3 targets</h4>
+          <div className="metricGrid">
+            <div className="metricCard"><span>Completed</span><strong>{discoveryBreakdown.counts.found2Completed}</strong></div>
+            <div className="metricCard"><span>Not completed</span><strong>{discoveryBreakdown.counts.found2NotCompleted}</strong></div>
+          </div>
+        </div>
+        <div className="outcomeGroup">
+          <h4>Found 1 of 3 targets</h4>
+          <div className="metricGrid">
+            <div className="metricCard"><span>Completed</span><strong>{discoveryBreakdown.counts.found1Completed}</strong></div>
+            <div className="metricCard"><span>Not completed</span><strong>{discoveryBreakdown.counts.found1NotCompleted}</strong></div>
+          </div>
+        </div>
+        <div className="outcomeGroup">
+          <h4>Found 0 of 3 targets</h4>
+          <div className="metricGrid">
+            <div className="metricCard"><span>Completed</span><strong>{discoveryBreakdown.counts.found0Completed}</strong></div>
+            <div className="metricCard"><span>Not completed</span><strong>{discoveryBreakdown.counts.found0NotCompleted}</strong></div>
+          </div>
+        </div>
+
+        <div className="outcomeGroup">
+          <h4>Other (not part of the classification above — a patient can appear here and in one bucket above)</h4>
+          <div className="metricGrid">
+            <div className="metricCard"><span>Patients with ≥1 object impact</span><strong>{impactBreakdown.patientsWithImpact}</strong></div>
+          </div>
         </div>
 
         <div className="behavioralSubgrid">
           <div className="behavioralSubcard">
             <h3>Success by condition</h3>
+            <p className="miniHint">{behavioralPatientCount} patients · {validTrialRows.length} trials analyzed.</p>
             <table className="miniTable">
-              <thead><tr><th>Condition</th><th>Found all targets</th><th>Valid trials</th></tr></thead>
+              <thead><tr><th>Condition</th><th>Found all targets</th><th>Valid trials</th><th>Patients</th></tr></thead>
               <tbody>
                 {conditionBreakdown.map((c) => (
-                  <tr key={c.condition}><td>{c.label}</td><td>{c.foundAll}</td><td>{c.total}</td></tr>
+                  <tr key={c.condition}><td>{c.label}</td><td>{c.foundAll}</td><td>{c.total}</td><td>{c.patientCount}</td></tr>
                 ))}
               </tbody>
             </table>
@@ -296,7 +396,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
 
           <div className="behavioralSubcard">
             <h3>Proximity escalation confirmed</h3>
-            <p className="miniHint">Trials where that target reached the closest proximity zone observed (bucket {proximityBreakdown.closestZone ?? '—'}).</p>
+            <p className="miniHint">{behavioralPatientCount} patients · {validTrialRows.length} trials analyzed. Trials where that target reached the closest proximity zone observed (bucket {proximityBreakdown.closestZone ?? '—'}).</p>
             <table className="miniTable">
               <thead><tr><th>Target</th><th>Trials reaching closest zone</th></tr></thead>
               <tbody>
@@ -309,6 +409,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
 
           <div className="behavioralSubcard">
             <h3>Object impacts by target</h3>
+            <p className="miniHint">{behavioralPatientCount} patients · {validTrialRows.length} trials analyzed. Counts are impact events, not trials — one trial can register more than one.</p>
             <table className="miniTable">
               <thead><tr><th>Target</th><th>Impact count</th></tr></thead>
               <tbody>
@@ -321,7 +422,10 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
 
           <div className="behavioralSubcard">
             <h3>Fastest completion per path</h3>
-            <p className="miniHint">Among completed exploration attempts (falls back to all attempts if none completed that path).</p>
+            <p className="miniHint">
+              {explorationAttemptPatientCount} patients · {explorationAttempts.length} exploration attempts considered (session-level, not deduplicated by trial).
+              Among completed attempts (falls back to all attempts if none completed that path).
+            </p>
             <table className="miniTable">
               <thead><tr><th>Path</th><th>Fastest</th><th>Patient</th></tr></thead>
               <tbody>
