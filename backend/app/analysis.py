@@ -1094,11 +1094,33 @@ def build_trials_df() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def learning_target_order(learn_feedback_df: pd.DataFrame, target_ids_in_order: List[str]) -> List[str]:
+    """The order targets actually first triggered feedback during the LEARNING
+    session — this is the real "correct" order for a trial, not the raw
+    hider_sequence_id config field. Empirically the two frequently disagree
+    (checked across real sessions: only ~1 in 12 matched exactly), since
+    hider_sequence_id looks like a static per-path label rather than a live
+    walkthrough script. Any target learning itself never triggered falls back
+    to its hider_sequence_id position, appended after the ones that did."""
+    discovered: List[Tuple[str, float]] = []
+    for tid in target_ids_in_order:
+        rows = learn_feedback_df[learn_feedback_df["target_id"] == tid] if learn_feedback_df is not None and not learn_feedback_df.empty else None
+        if rows is not None and not rows.empty and "t_s" in rows:
+            discovered.append((tid, float(rows["t_s"].min())))
+    discovered.sort(key=lambda x: x[1])
+    order = [d[0] for d in discovered]
+    for tid in target_ids_in_order:
+        if tid not in order:
+            order.append(tid)
+    return order
+
+
 def compute_target_discovery(feedback_df: pd.DataFrame, target_ids_in_order: List[str]) -> Dict[str, Any]:
     """Which of the trial's targets got any feedback during exploration ("found"
     = made it sound/vibrate at all, not just reaching the closest zone), in what
-    order, and whether that order matches the learning session's own intended
-    visit order (target_ids_in_order = the raw session's hider_sequence_id)."""
+    order, and whether that order matches the learning session's own actual
+    visit order (target_ids_in_order should be learning_target_order(...), not
+    the raw hider_sequence_id — see that function's docstring for why)."""
     targets_out: List[Dict[str, Any]] = []
     discovered: List[Tuple[str, float]] = []
     empty_df = feedback_df.iloc[0:0] if feedback_df is not None else pd.DataFrame()
@@ -1166,9 +1188,11 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
     if learn_xy.empty or exp_xy.empty:
         return {**empty, "note": "empty trajectory for learning or exploration session"}
 
-    # Intended visit order comes from the learning session's own hider_sequence_id
-    # (what the exploration is being checked against), not the exploration's.
-    target_discovery = compute_target_discovery(session_to_feedback_df(exp_data), learn_config["target_ids"])
+    # "Correct" visit order = the order targets actually first sounded during
+    # the learning session itself (not the raw hider_sequence_id config field
+    # — see learning_target_order's docstring for why that's the wrong source).
+    intended_order = learning_target_order(session_to_feedback_df(learn_data), learn_config["target_ids"])
+    target_discovery = compute_target_discovery(session_to_feedback_df(exp_data), intended_order)
     target_impacts = compute_target_impacts(exp_tracking_df, exp_config["seeker_id"], exp_config["target_ids"])
 
     lx, ly = learn_xy["x"].to_numpy(), learn_xy["y"].to_numpy()
