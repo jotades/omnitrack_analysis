@@ -11,6 +11,9 @@ import numpy as np
 import pandas as pd
 
 from .annotations import annotation_key, get_annotation, load_annotations
+from .manual_discovery import get_manual_discovery_override
+from .phase_overrides import load_phase_overrides
+from .target_coordinates import get_target_coordinates
 from .settings import get_settings
 
 settings = get_settings()
@@ -61,6 +64,9 @@ def clear_caches() -> None:
     build_sessions_index_cached.cache_clear()
     load_session_metrics.cache_clear()
     load_trial_metrics.cache_clear()
+    load_exploration_movement_events.cache_clear()
+    load_target_sensor_proximity.cache_clear()
+    compute_speed_accel_correlations.cache_clear()
 
 
 def discover_json_files(base_dir: Path) -> List[Tuple[Path, Optional[str]]]:
@@ -218,6 +224,12 @@ def build_sessions_index_cached(base_dir_str: str) -> pd.DataFrame:
 
 
 def build_sessions_index(base_dir: Path) -> pd.DataFrame:
+    # Manual corrections for a session recorded under the wrong phase
+    # (experimenter picked learning/exploration wrong at collection time) —
+    # loaded once per index build, applied by file_name below. Since this
+    # function is itself wrapped by build_sessions_index_cached, a correction
+    # only takes effect after /api/refresh, same as adding/removing raw files.
+    phase_overrides = load_phase_overrides()
     rows: List[Dict[str, Any]] = []
     for fp, patient_hint in discover_json_files(base_dir):
         filename_info = parse_filename(fp)
@@ -226,7 +238,7 @@ def build_sessions_index(base_dir: Path) -> pd.DataFrame:
         except Exception as exc:
             rows.append({
                 "patient": patient_hint or filename_info.get("patient") or "unknown",
-                "phase": filename_info.get("phase"),
+                "phase": phase_overrides.get(fp.name, filename_info.get("phase")),
                 "condition": filename_info.get("condition"),
                 "path_id": filename_info.get("path_id"),
                 "start_time": filename_info.get("start_time_from_filename"),
@@ -246,7 +258,7 @@ def build_sessions_index(base_dir: Path) -> pd.DataFrame:
         raw = data.get("raw_data") or []
         status = session_status_from_raw(raw)
         patient = patient_hint or data.get("patient") or filename_info.get("patient") or "unknown"
-        phase = data.get("task") or filename_info.get("phase") or "unknown"
+        phase = phase_overrides.get(fp.name) or data.get("task") or filename_info.get("phase") or "unknown"
         condition = data.get("condition") or filename_info.get("condition") or "unknown"
         path_id = data.get("path_id") or filename_info.get("path_id") or "unknown"
         start_time = data.get("start_time") or filename_info.get("start_time_from_filename")
@@ -308,6 +320,40 @@ def extract_config(data: Dict[str, Any]) -> Dict[str, Any]:
         "proximity_profiles": proximity_profiles,
         "profiles_by_id": profiles_by_id,
         "anchors": anchors,
+    }
+
+
+def save_activation_distance(
+    session_id: int,
+    min_activation_distance: float,
+    max_activation_distance: float,
+) -> Dict[str, Any]:
+    """Overwrites min/max activation distance directly in the session's raw
+    JSON file, on every raw_data entry that carries a distance block, so the
+    file reads as if it had been recorded with this value from the start."""
+    sessions_df = get_sessions_df()
+    if session_id < 0 or session_id >= len(sessions_df):
+        raise IndexError(f"session_id non valido: {session_id}")
+    file_path = Path(sessions_df.iloc[int(session_id)]["file_path"])
+    with file_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    updated = 0
+    for entry in data.get("raw_data") or []:
+        distance = _safe_get(entry, ["metadata", "activity_cfg", "params", "feedback_task", "inputs", "distance"])
+        if isinstance(distance, dict):
+            distance["min_activation_distance"] = min_activation_distance
+            distance["max_activation_distance"] = max_activation_distance
+            updated += 1
+
+    with file_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    clear_caches()
+    return {
+        "min_activation_distance": min_activation_distance,
+        "max_activation_distance": max_activation_distance,
+        "updated_entries": updated,
     }
 
 
@@ -632,33 +678,52 @@ def _heading_change_deg(resampled: pd.DataFrame, step_m: float) -> np.ndarray:
     return change
 
 
-def detect_turns(xy_df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Auto-detect up to 3 turns along a trajectory (used on the learning phase as the
-    "ideal"/learned reference — no hardcoded per-path waypoints)."""
-    step_m = settings.turn_resample_step_m
-    resampled = resample_by_arc_length(xy_df, step_m)
-    change = _heading_change_deg(resampled, step_m)
-    if len(change) == 0:
-        return []
-    min_gap_idx = max(1, int(round(settings.turn_min_separation_m / step_m)))
-    picks: List[int] = []
-    for i in np.argsort(-change):
-        if change[i] < settings.min_turn_heading_change_deg:
-            break
-        if all(abs(int(i) - p) > min_gap_idx for p in picks):
-            picks.append(int(i))
-        if len(picks) >= 3:
-            break
-    picks.sort()
+def target_tag_positions(tracking_df: pd.DataFrame, target_ids: List[str]) -> Dict[str, Tuple[float, float]]:
+    """Median (x, y) of each target tag's own tracked position — the targets
+    are stationary physical objects, so this is their real placement in the
+    room for this trial. Empty for any target_id this condition never tracked
+    (e.g. haptic_on_object_intes tracked only the seeker P1)."""
+    positions: Dict[str, Tuple[float, float]] = {}
+    for tid in target_ids:
+        rows = tracking_df[(tracking_df["tag_id"] == tid) & tracking_df["x"].notna() & tracking_df["y"].notna()]
+        if rows.empty:
+            continue
+        positions[tid] = (float(rows["x"].median()), float(rows["y"].median()))
+    return positions
+
+
+IDEAL_TURN_ANGLE_DEG = 90.0
+
+
+def canonical_turn_angles(
+    waypoints_in_order: List[Tuple[str, Tuple[float, float]]]
+) -> List[Dict[str, Any]]:
+    """The reference turn angle at each target is no longer measured from the
+    (noisy) recorded learning trajectory, and not even the geometric angle of
+    the real tracked positions — it's a flat IDEAL_TURN_ANGLE_DEG (90°), the
+    path's own design intent (confirmed by the researcher: every turn is a
+    right angle by construction; any deviation the real geometry would show
+    is itself just imprecision in the tracked target position, not a
+    different intended angle). Turn LOCATIONS still come from the real
+    tracked positions, in intended visit order — only the reference angle at
+    each one is now fixed. This is immune to the walking noise, pauses, and
+    confused backtracking that made measuring the angle from the learning
+    trajectory's own shape unreliable (a person pausing or circling right at
+    a target could make that specific measurement read anywhere from ~0° to
+    over 300°).
+    waypoints_in_order: [("start", xy), ("O1", xy), ("O2", xy), ("O3", xy), ("stop", xy)]
+    (fewer target waypoints if this condition didn't track all of them).
+    Returns one entry per INTERIOR waypoint (i.e. per target, not start/stop)."""
     turns = []
-    for turn_index, i in enumerate(picks):
-        row = resampled.iloc[i]
+    for i in range(1, len(waypoints_in_order) - 1):
+        target_id, p_cur = waypoints_in_order[i]
+        change = IDEAL_TURN_ANGLE_DEG
         turns.append({
-            "turn_index": turn_index,
-            "s_m": float(row["s_m"]),
-            "x": float(row["x"]),
-            "y": float(row["y"]),
-            "heading_change_deg": float(change[i]),
+            "turn_index": i - 1,
+            "target_id": target_id,
+            "x": float(p_cur[0]),
+            "y": float(p_cur[1]),
+            "heading_change_deg": float(change),
         })
     return turns
 
@@ -1120,7 +1185,13 @@ def compute_target_discovery(feedback_df: pd.DataFrame, target_ids_in_order: Lis
     = made it sound/vibrate at all, not just reaching the closest zone), in what
     order, and whether that order matches the learning session's own actual
     visit order (target_ids_in_order should be learning_target_order(...), not
-    the raw hider_sequence_id — see that function's docstring for why)."""
+    the raw hider_sequence_id — see that function's docstring for why).
+
+    Feedback-only — deliberately doesn't know about manually-entered target
+    coordinates (see apply_manual_target_coords below): this result is cached
+    via load_trial_metrics, and a coordinate the researcher enters later must
+    take effect immediately, not only after the cache is invalidated.
+    """
     targets_out: List[Dict[str, Any]] = []
     discovered: List[Tuple[str, float]] = []
     empty_df = feedback_df.iloc[0:0] if feedback_df is not None else pd.DataFrame()
@@ -1133,6 +1204,7 @@ def compute_target_discovery(feedback_df: pd.DataFrame, target_ids_in_order: Lis
         targets_out.append({
             "target_id": tid, "path_order": idx, "found": found,
             "first_feedback_t_s": first_t, "min_bucket": min_bucket, "max_intensity": max_intensity,
+            "source": "feedback" if found else None, "manual_xy": None,
         })
         if found and first_t is not None:
             discovered.append((tid, first_t))
@@ -1149,6 +1221,108 @@ def compute_target_discovery(feedback_df: pd.DataFrame, target_ids_in_order: Lis
     }
 
 
+def apply_manual_target_coords(
+    target_discovery: Dict[str, Any],
+    exp_xy: pd.DataFrame,
+    manual_coords: Dict[str, List[float]],
+) -> Dict[str, Any]:
+    """Re-derive found/source/order for a (cached, feedback-only) target_discovery
+    dict using freshly-loaded manual coordinates — called from compare_trials,
+    outside any cache, so a newly-entered coordinate is reflected immediately.
+
+    Some conditions (e.g. haptic_on_object_intes) never tracked the O1/O2/O3
+    tags at all — only the seeker P1 — so feedback events may be sparse or
+    absent even though the participant genuinely walked up to the object. When
+    a target isn't found via feedback and the researcher has manually entered
+    that target's real-world coordinate (the sensor position doesn't exist to
+    derive it from), fall back to a distance check: the seeker's own
+    trajectory (exp_xy) coming within settings.manual_target_found_radius_m of
+    that point also counts as found.
+    """
+    if not manual_coords:
+        return target_discovery
+    target_ids_in_order = [t["target_id"] for t in sorted(target_discovery["targets"], key=lambda t: t["path_order"])]
+    targets_out: List[Dict[str, Any]] = []
+    discovered: List[Tuple[str, float]] = []
+    has_xy = exp_xy is not None and not exp_xy.empty
+    ex = exp_xy["x"].to_numpy() if has_xy else None
+    ey = exp_xy["y"].to_numpy() if has_xy else None
+    et = exp_xy["t_s"].to_numpy() if has_xy else None
+    for t in target_discovery["targets"]:
+        t = dict(t)
+        tid = t["target_id"]
+        manual_xy = [float(v) for v in manual_coords[tid]] if tid in manual_coords else None
+        if not t["found"] and manual_xy is not None and has_xy:
+            dists = np.hypot(ex - manual_xy[0], ey - manual_xy[1])
+            within = np.where(dists <= settings.manual_target_found_radius_m)[0]
+            if len(within):
+                t["found"] = True
+                t["source"] = "manual_distance"
+                t["first_feedback_t_s"] = float(et[within[0]])
+        t["manual_xy"] = manual_xy
+        targets_out.append(t)
+        if t["found"] and t["first_feedback_t_s"] is not None:
+            discovered.append((tid, t["first_feedback_t_s"]))
+    discovered.sort(key=lambda x: x[1])
+    discovery_order = [d[0] for d in discovered]
+    expected_relative_order = [t for t in target_ids_in_order if t in discovery_order]
+    return {
+        "targets": targets_out,
+        "found_count": len(discovery_order),
+        "discovery_order": discovery_order,
+        "in_order": (discovery_order == expected_relative_order) if discovery_order else None,
+    }
+
+
+def apply_manual_discovery_overrides(
+    target_discovery: Dict[str, Any],
+    override: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Manual found/in-order flags (manual_discovery.py) always win over the
+    automatic feedback/distance-based detection above (apply_manual_target_coords)
+    — for cases where the researcher directly knows the outcome (e.g. from
+    notes/video) better than the heuristics can guess it. Uncached, like
+    apply_manual_target_coords, so a flag entered a moment ago is reflected
+    immediately, without needing /api/refresh. Always run (even with no
+    override set) so manual_found_override/manual_in_order_override are
+    always present in the response — the frontend's tri-state selects
+    (Auto-detected / Found / Not found) need the raw override value, not
+    just its effect on `found`, to know which option is selected.
+
+    A manual "found" override only flips the found/not-found fact. Since a
+    manually-flagged find has no real timestamp, it drops out of
+    discovery_order (it can't be timing-ordered against the others) — it
+    still counts toward found_count, but the automatic in_order verdict
+    becomes unreliable once that happens, which is exactly when the manual
+    "in_order" override (replacing the verdict outright) is meant to be used.
+    """
+    targets_found_override: Dict[str, bool] = override.get("targets_found") or {}
+    in_order_override: Optional[bool] = override.get("in_order")
+    targets_out: List[Dict[str, Any]] = []
+    discovery_order = list(target_discovery["discovery_order"])
+    for t in target_discovery["targets"]:
+        t = dict(t)
+        tid = t["target_id"]
+        manual_found = targets_found_override.get(tid)
+        t["manual_found_override"] = manual_found
+        if manual_found is not None and manual_found != t["found"]:
+            t["found"] = manual_found
+            t["source"] = "manual_flag" if manual_found else None
+            if not manual_found:
+                t["first_feedback_t_s"] = None
+            discovery_order = [d for d in discovery_order if d != tid]
+        targets_out.append(t)
+    found_count = sum(1 for t in targets_out if t["found"])
+    in_order = in_order_override if in_order_override is not None else target_discovery["in_order"]
+    return {
+        "targets": targets_out,
+        "found_count": found_count,
+        "discovery_order": discovery_order,
+        "in_order": in_order,
+        "manual_in_order_override": in_order_override,
+    }
+
+
 def compute_target_impacts(tracking_df: pd.DataFrame, seeker_id: str, target_ids: List[str]) -> Dict[str, int]:
     """Number of probable physical hits per target tag (reuses the impact
     detection already used for IMU quality — a target sensor spiking above its
@@ -1161,15 +1335,138 @@ def compute_target_impacts(tracking_df: pd.DataFrame, seeker_id: str, target_ids
     return counts
 
 
+def resample_by_arclength(xy: np.ndarray, n_points: int) -> np.ndarray:
+    """Resample an (N, 2) polyline to n_points equally spaced by arc length
+    (distance traveled), not by sample index/time — so two trajectories walked
+    at different speeds still compare point-by-point at the same relative
+    position along their own route, not at the same moment in time."""
+    if len(xy) == 1:
+        return np.repeat(xy, n_points, axis=0)
+    deltas = np.diff(xy, axis=0)
+    seg_lengths = np.hypot(deltas[:, 0], deltas[:, 1])
+    cum_lengths = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+    total_length = cum_lengths[-1]
+    if total_length == 0:
+        return np.repeat(xy[:1], n_points, axis=0)
+    target_lengths = np.linspace(0.0, total_length, n_points)
+    x_resampled = np.interp(target_lengths, cum_lengths, xy[:, 0])
+    y_resampled = np.interp(target_lengths, cum_lengths, xy[:, 1])
+    return np.column_stack([x_resampled, y_resampled])
+
+
+def discrete_frechet_distance(p: np.ndarray, q: np.ndarray) -> float:
+    """Discrete Fréchet distance (Eiter & Mannila, 1994) between two point
+    sequences p (n points) and q (m points): the smallest "leash length"
+    connecting a walker on p to a walker on q if both may only move forward
+    (never backtrack) along their own sequence, choosing their pace
+    independently to minimize the longest leash needed at any moment.
+
+    Recurrence (d = Euclidean distance between two points):
+        ca(0,0)   = d(p_0, q_0)
+        ca(i,0)   = max(ca(i-1,0), d(p_i, q_0))
+        ca(0,j)   = max(ca(0,j-1), d(p_0, q_j))
+        ca(i,j)   = max(d(p_i, q_j), min(ca(i-1,j), ca(i-1,j-1), ca(i,j-1)))
+    Result = ca(n-1, m-1).
+
+    Unlike a mean deviation, this is a worst-case number: a single detour
+    raises it for the whole trial even if every other point matches closely.
+    Run on the same 100-point arc-length-resampled routes as shape_overlap_pct
+    (see resample_by_arclength) — O(n*m) DP, cheap at that size, and directly
+    comparable between the two metrics.
+    """
+    n, m = len(p), len(q)
+    # Plain Python lists, not numpy scalar indexing, inside the DP loop: with
+    # bulk fetches computing this for every trial (100x100 = 10k cells each),
+    # numpy's per-element access overhead made this the single slowest part
+    # of the whole bulk endpoint — plain float/list ops are ~10x faster here.
+    d = np.hypot(p[:, None, 0] - q[None, :, 0], p[:, None, 1] - q[None, :, 1]).tolist()
+    ca = [[0.0] * m for _ in range(n)]
+    ca[0][0] = d[0][0]
+    for i in range(1, n):
+        ca[i][0] = max(ca[i - 1][0], d[i][0])
+    for j in range(1, m):
+        ca[0][j] = max(ca[0][j - 1], d[0][j])
+    for i in range(1, n):
+        ca_i, ca_im1, d_i = ca[i], ca[i - 1], d[i]
+        for j in range(1, m):
+            ca_i[j] = max(min(ca_im1[j], ca_im1[j - 1], ca_i[j - 1]), d_i[j])
+    return float(ca[-1][-1])
+
+
+def dtw_distance(p: np.ndarray, q: np.ndarray) -> float:
+    """Dynamic Time Warping distance between p (n points) and q (m points),
+    normalized by n so the result is an average cost per step, in meters —
+    directly comparable to shape_deviation_m. Unlike Fréchet's rigid
+    "move forward one step at a time" pairing, DTW may match one point on p
+    against several consecutive points on q (and vice versa), so it tolerates
+    pacing differences — e.g. pausing, or a slightly longer detour that still
+    ends up in the same place — that a same-index or step-locked comparison
+    would over-penalize. Unlike Fréchet's worst case, this is a total/average,
+    so it's dragged down by every point rather than dominated by the single
+    worst one.
+
+    Recurrence (d = Euclidean distance between two points):
+        dtw(0,0) = 0
+        dtw(i,j) = d(p_i, q_j) + min(dtw(i-1,j), dtw(i-1,j-1), dtw(i,j-1))
+    Result = dtw(n,m) / n.
+    """
+    n, m = len(p), len(q)
+    d = np.hypot(p[:, None, 0] - q[None, :, 0], p[:, None, 1] - q[None, :, 1]).tolist()
+    inf = float("inf")
+    dtw = [[inf] * (m + 1) for _ in range(n + 1)]
+    dtw[0][0] = 0.0
+    for i in range(1, n + 1):
+        dtw_i, dtw_im1, d_im1 = dtw[i], dtw[i - 1], d[i - 1]
+        for j in range(1, m + 1):
+            dtw_i[j] = d_im1[j - 1] + min(dtw_im1[j], dtw_im1[j - 1], dtw_i[j - 1])
+    return float(dtw[n][m] / n)
+
+
+def lcss_similarity_pct(p: np.ndarray, q: np.ndarray, epsilon: float) -> float:
+    """Longest Common Subsequence similarity (%) between p (n points) and q
+    (m points): the longest run of point-pairs (i, j), taken in order but with
+    any number of unmatched points freely skipped on either side, where each
+    matched pair is within epsilon of each other — normalized by the shorter
+    route's length so a full match = 100%. Unlike Fréchet/DTW/shape overlap,
+    which score EVERY point (one bad detour drags all three down), LCSS simply
+    skips a detour or noisy stretch entirely instead of being penalized by it
+    — the most forgiving of the group, and the best at answering "did most of
+    the route still match, ignoring one bad patch?".
+
+    Recurrence (d = Euclidean distance between two points):
+        lcss(i,j) = lcss(i-1,j-1) + 1               if d(p_i, q_j) <= epsilon
+        lcss(i,j) = max(lcss(i-1,j), lcss(i,j-1))    otherwise
+    Result = 100 * lcss(n,m) / min(n,m).
+    """
+    n, m = len(p), len(q)
+    if min(n, m) == 0:
+        return 0.0
+    d = np.hypot(p[:, None, 0] - q[None, :, 0], p[:, None, 1] - q[None, :, 1]).tolist()
+    lcss = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        lcss_i, lcss_im1, d_im1 = lcss[i], lcss[i - 1], d[i - 1]
+        for j in range(1, m + 1):
+            if d_im1[j - 1] <= epsilon:
+                lcss_i[j] = lcss_im1[j - 1] + 1
+            else:
+                lcss_i[j] = max(lcss_im1[j], lcss_i[j - 1])
+    return float(100.0 * lcss[n][m] / min(n, m))
+
+
 def compute_trial_metrics(learning_session_id: Optional[int], exploration_session_id: Optional[int]) -> Dict[str, Any]:
     """Compare an exploration trajectory against its trial's learning trajectory:
     route overlap, turn-by-turn deviation, and stop/start position drift."""
     empty = {
         "overlap_pct": None, "mean_deviation_m": None,
+        "shape_overlap_pct": None, "shape_deviation_m": None, "frechet_distance_m": None,
+        "dtw_distance_m": None, "lcss_pct": None, "shape_deviation_profile": None,
+        "learn_resampled_xy": None, "exp_resampled_xy": None,
         "turns": [], "wrong_turns_count": None, "mean_turn_deviation_deg": None,
         "stop_position_distance_m": None, "start_position_distance_m": None,
         "ideal_stop_xy": None, "ideal_start_xy": None,
-        "return_to_start_distance_m": None, "target_discovery": None, "target_impacts": {},
+        "return_to_start_distance_m": None, "self_return_distance_m": None,
+        "target_discovery": None, "target_impacts": {},
+        "ideal_path_length_m": None,
     }
     if learning_session_id is None or exploration_session_id is None:
         return {**empty, "note": "missing learning or exploration session for this trial"}
@@ -1183,7 +1480,8 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
     exp_config = extract_config(exp_data)
 
     exp_tracking_df = session_to_tracking_df(exp_data)
-    learn_xy = p1_xy(session_to_tracking_df(learn_data), learn_config["seeker_id"])
+    learn_tracking_df = session_to_tracking_df(learn_data)
+    learn_xy = p1_xy(learn_tracking_df, learn_config["seeker_id"])
     exp_xy = p1_xy(exp_tracking_df, exp_config["seeker_id"])
     if learn_xy.empty or exp_xy.empty:
         return {**empty, "note": "empty trajectory for learning or exploration session"}
@@ -1207,7 +1505,47 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
     overlap_pct = float(100.0 * np.mean(min_dist <= settings.trial_overlap_buffer_m))
     mean_deviation_m = float(min_dist.mean())
 
-    turns = detect_turns(learn_xy)
+    # Shape overlap: same buffer threshold as above, but point-by-point at the
+    # same relative position along each route (arc-length resampled) instead
+    # of nearest-neighbor-anywhere-on-the-route — this respects order/direction,
+    # so wandering back and forth in the same general area (which can score
+    # high on overlap_pct) doesn't score high here unless it's the same shape.
+    n_pts = settings.trial_shape_resample_points
+    learn_resampled = resample_by_arclength(np.column_stack([lx, ly]), n_pts)
+    exp_resampled = resample_by_arclength(np.column_stack([ex, ey]), n_pts)
+    pointwise_dist = np.hypot(
+        exp_resampled[:, 0] - learn_resampled[:, 0], exp_resampled[:, 1] - learn_resampled[:, 1]
+    )
+    shape_overlap_pct = float(100.0 * np.mean(pointwise_dist <= settings.trial_overlap_buffer_m))
+    shape_deviation_m = float(pointwise_dist.mean())
+    frechet_distance_m = discrete_frechet_distance(learn_resampled, exp_resampled)
+    dtw_distance_m = dtw_distance(learn_resampled, exp_resampled)
+    lcss_pct = lcss_similarity_pct(learn_resampled, exp_resampled, settings.trial_overlap_buffer_m)
+
+    # Reference turn angle at each target = the geometric angle of the IDEAL
+    # straight-line route start -> O_n -> O_n+1 -> O_n+2 -> stop (the path's
+    # own design intent), not whatever the noisy recorded learning trajectory
+    # happened to measure there (see canonical_turn_angles' docstring — a
+    # pause or confused circling right at a target could make that specific
+    # measurement read anywhere from ~0° to 300°+, contaminating the very
+    # thing it's supposed to be the trustworthy reference for). No waypoint
+    # for a target this condition never tracked (e.g. haptic_on_object_intes)
+    # — that target is simply skipped, not guessed at.
+    target_positions = target_tag_positions(learn_tracking_df, learn_config["target_ids"])
+    ordered_target_positions = [(tid, target_positions[tid]) for tid in intended_order if tid in target_positions]
+    waypoints = [("start", (float(lx[0]), float(ly[0]))), *ordered_target_positions, ("stop", (float(lx[-1]), float(ly[-1])))]
+    # Shortest possible route through the waypoints in visit order — straight
+    # line start -> O_n -> O_n+1 -> ... -> stop, NOT the learning trajectory's
+    # own (noisy, longer) path. This is the "ideal" length behind the
+    # path-efficiency metric in compute_navigation_metrics: ideal / actual
+    # distance traveled — see that function's docstring for where this exact
+    # ratio is actually precedented (Morris water maze spatial-navigation
+    # research).
+    ideal_path_length_m = sum(
+        math.hypot(waypoints[i + 1][1][0] - waypoints[i][1][0], waypoints[i + 1][1][1] - waypoints[i][1][1])
+        for i in range(len(waypoints) - 1)
+    )
+    turns = canonical_turn_angles(waypoints)
     turn_results = []
     deviations = []
     for t in turns:
@@ -1219,7 +1557,10 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
             wrong_turn = deviation_deg > settings.wrong_turn_threshold_deg
         turn_results.append({
             "turn_index": t["turn_index"],
-            "learned_heading_change_deg": t["heading_change_deg"],
+            "target_id": t["target_id"],
+            "x": t["x"],
+            "y": t["y"],
+            "ideal_heading_change_deg": t["heading_change_deg"],
             "exploration_heading_change_deg": exp_change,
             "deviation_deg": deviation_deg,
             "wrong_turn": wrong_turn,
@@ -1230,8 +1571,26 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
     return {
         "overlap_pct": overlap_pct,
         "mean_deviation_m": mean_deviation_m,
+        "shape_overlap_pct": shape_overlap_pct,
+        "shape_deviation_m": shape_deviation_m,
+        "frechet_distance_m": frechet_distance_m,
+        "dtw_distance_m": dtw_distance_m,
+        "lcss_pct": lcss_pct,
+        # Per-point deviation (d_k from the Shape overlap definition), exposed
+        # so the frontend can chart "how far apart were learning and exploration
+        # at k% of the way along the route" instead of only the mean/threshold
+        # summary above — shows WHERE along the route the deviation happened.
+        "shape_deviation_profile": pointwise_dist.tolist(),
+        # The actual (x, y) of the two 100-point resampled routes — lets the
+        # frontend highlight "point k" on the map when hovering point k on the
+        # deviation profile chart, without re-implementing the resampling.
+        "learn_resampled_xy": learn_resampled.tolist(),
+        "exp_resampled_xy": exp_resampled.tolist(),
         "turns": turn_results,
-        "wrong_turns_count": sum(1 for t in turn_results if t["wrong_turn"]),
+        # None (not 0) when no target position could be anchored at all (e.g.
+        # haptic_on_object_intes never tracked O1/O2/O3) — 0 would misleadingly
+        # read as "checked, no wrong turns" rather than "couldn't check".
+        "wrong_turns_count": sum(1 for t in turn_results if t["wrong_turn"]) if turn_results else None,
         "mean_turn_deviation_deg": float(np.mean(deviations)) if deviations else None,
         # Stop position: how far the exploration's end point is from the learning
         # trajectory's own end point (the "ideal" stop location).
@@ -1245,14 +1604,393 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
         # learning trajectory's START point — did they go out and come back?
         # (Reuses ideal_start_xy as the same "ideal" point for this metric too.)
         "return_to_start_distance_m": float(math.hypot(lx[0] - ex[-1], ly[0] - ey[-1])),
+        # Self-referential variant: exploration's own END point vs its own START
+        # point (ignores the learning session's start entirely) — investigative
+        # field to check whether anchoring "completed" to the exploration's own
+        # start (rather than learning's) changes how many trials count as completed.
+        "self_return_distance_m": float(math.hypot(ex[0] - ex[-1], ey[0] - ey[-1])),
         "target_discovery": target_discovery,
         "target_impacts": target_impacts,
+        "ideal_path_length_m": float(ideal_path_length_m),
     }
 
 
 @lru_cache(maxsize=2048)
 def load_trial_metrics(learning_session_id: Optional[int], exploration_session_id: Optional[int]) -> Dict[str, Any]:
     return compute_trial_metrics(learning_session_id, exploration_session_id)
+
+
+@lru_cache(maxsize=2048)
+def load_exploration_movement_events(exploration_session_id: int) -> Dict[str, Any]:
+    """Stop and border-crossing counts for one exploration session, cached —
+    compare_trials (every trial, every patient) and compute_speed_accel_correlations
+    (every trial in the whole dataset) both need this same tracking-file reload,
+    and it doesn't depend on anything that a manual annotation/coordinate edit
+    would change (unlike load_trial_metrics' target discovery)."""
+    sessions_df = get_sessions_df()
+    row = sessions_df.iloc[int(exploration_session_id)]
+    data = load_json_cached(str(row["file_path"]))
+    config = extract_config(data)
+    tracking_df = session_to_tracking_df(data)
+    speed_df = compute_speed_df(tracking_df, seeker_id=config["seeker_id"], rolling_window=settings.speed_rolling_window)
+    bbox = compute_room_bbox(config["anchors"])
+    return {
+        "stop_count": compute_stop_events(speed_df)["count"],
+        "border_reached_count": compute_border_events(tracking_df, config["seeker_id"], bbox)["count"],
+    }
+
+
+@lru_cache(maxsize=2048)
+def load_target_sensor_proximity(exploration_session_id: int) -> Dict[str, float]:
+    """Closest geometric distance the seeker ever got to EACH sensor-tracked
+    target individually, cached — like load_exploration_movement_events and
+    load_session_metrics, compute_distances' full merge over the tracking
+    data is too expensive to redo on every /api/trials/compare request for
+    every trial (this was previously uncached and dominated that endpoint's
+    response time on every call, not just the first cold one).
+
+    Only covers targets with their own sensor; manually-entered coordinates
+    aren't cacheable (a newly-entered one must show up immediately) — see
+    compute_target_proximity, which merges this with the live manual
+    fallback.
+    """
+    sessions_df = get_sessions_df()
+    row = sessions_df.iloc[int(exploration_session_id)]
+    data = load_json_cached(str(row["file_path"]))
+    config = extract_config(data)
+    tracking_df = session_to_tracking_df(data)
+    dist_df = compute_distances(tracking_df, seeker_id=config["seeker_id"], target_ids=config["target_ids"])
+    result: Dict[str, float] = {}
+    if not dist_df.empty:
+        for tid, g in dist_df.groupby("target_id"):
+            d = pd.to_numeric(g["distance"], errors="coerce").dropna()
+            if not d.empty:
+                result[tid] = float(d.min())
+    return result
+
+
+def compute_target_proximity(
+    exploration_session_id: int,
+    exp_xy: Optional[pd.DataFrame] = None,
+    manual_coords: Optional[Dict[str, List[float]]] = None,
+) -> Dict[str, float]:
+    """Closest geometric distance the seeker ever got to EACH target
+    individually — one entry per target this path has a coordinate for,
+    keyed by target_id (e.g. "O1"). Deliberately NOT the same thing as
+    min_closest_distance (session metric)/closest_df, which at every instant
+    keep only whichever target happens to be nearest right then: a trial that
+    walked right up to O1 but never near O2/O3 reads as "very close" there,
+    while this returns three separate numbers so a per-target average (see
+    compute_performance_score and compute_navigation_metrics, which both use
+    it) actually reflects all of them, not just the best one.
+
+    Falls back to a straight-line distance against a manually-entered
+    coordinate (see apply_manual_target_coords) for any target never tracked
+    by its own sensor (e.g. haptic_on_object_intes, which only tracked P1) —
+    same fallback source, just min distance instead of a found/not-found
+    threshold. The manual part is computed live (not cached), same as
+    apply_manual_target_coords, so a coordinate entered a moment ago shows up
+    immediately.
+    """
+    result = dict(load_target_sensor_proximity(exploration_session_id))
+    if manual_coords and exp_xy is not None and not exp_xy.empty:
+        ex, ey = exp_xy["x"].to_numpy(), exp_xy["y"].to_numpy()
+        for tid, xy in manual_coords.items():
+            if tid in result:
+                continue  # sensor-tracked distance already computed above is the more direct measurement
+            result[tid] = float(np.hypot(ex - xy[0], ey - xy[1]).min())
+    return result
+
+
+def _linear_good_bad_score(value: Optional[float], good: float, bad: float) -> Optional[float]:
+    """1.0 at/below `good`, 0.0 at/above `bad`, linear in between — `good` must
+    be < `bad`, which holds for every measure this scores (a smaller distance
+    or fewer border crossings is always the better outcome)."""
+    if value is None or not np.isfinite(value):
+        return None
+    if value <= good:
+        return 1.0
+    if value >= bad:
+        return 0.0
+    return float((bad - value) / (bad - good))
+
+
+def compute_performance_score(
+    stop_position_distance_m: Optional[float],
+    target_proximities_m: Dict[str, float],
+    target_found: Dict[str, bool],
+    found_count: Optional[int],
+    found_total: Optional[int],
+    border_reached_count: Optional[int],
+) -> Dict[str, Any]:
+    """1-5 performance rating for one exploration attempt, built from exactly
+    the measures the researcher framed as "task success": how close the
+    attempt ended up to the learning route's own end point, how close it got
+    to EACH target (O1-On) individually and how many of them were actually
+    found, and how many times it left the 8x6 m safety border (a penalty even
+    for an attempt that otherwise finished).
+
+    "Target proximity" and "Targets found" are deliberately two separate
+    components, not one: proximity is a continuous geometric distance (can
+    still be scored even if feedback never fired), found_count/found_total is
+    the discrete "did the feedback/manual-distance check actually register
+    it" outcome (see target_discovery) — related but not redundant, since a
+    target can be walked past just outside the activation radius (close by
+    distance, not "found") or found via a delayed/edge-case trigger.
+
+    Each measure is scored 1 (good) to 0 (bad) via _linear_good_bad_score
+    using the performance_* reference constants in settings (found_count/
+    found_total is already a 0-1 fraction, used as-is), then blended by fixed
+    weights (endpoint 0.30 / target proximity 0.25 / targets found 0.25 /
+    border 0.20) into a single 0-1 composite, mapped onto 1-5
+    (round(1 + 4*composite)).
+
+    This is a heuristic index, NOT a validated measure from the literature —
+    the weights and good/bad thresholds are reasonable defaults, not
+    calibrated against expert judgment or outcome data. compute_navigation_metrics
+    (below) reports the same underlying facts as individually-established
+    O&M/wayfinding measures instead, with no combining/weighting, for
+    comparison against this composite.
+
+    Speed and peak acceleration are intentionally absent from this formula:
+    see compute_speed_accel_correlations, computed across the whole dataset,
+    which is the actual check for whether they relate to outcome at all.
+
+    A measure with no data at all (e.g. no target ever tracked for this
+    condition and no manual coordinate entered) is dropped and the remaining
+    weights renormalized, rather than counting as a 0. Returns score=None (no
+    line shown) only if every measure is missing.
+    """
+    endpoint_score = _linear_good_bad_score(
+        stop_position_distance_m, settings.performance_endpoint_good_m, settings.performance_endpoint_bad_m
+    )
+
+    per_target_scores = {
+        tid: _linear_good_bad_score(d, settings.performance_target_good_m, settings.performance_target_bad_m)
+        for tid, d in target_proximities_m.items()
+    }
+    valid_target_scores = [s for s in per_target_scores.values() if s is not None]
+    target_score = float(np.mean(valid_target_scores)) if valid_target_scores else None
+    target_mean_raw = float(np.mean(list(target_proximities_m.values()))) if target_proximities_m else None
+
+    found_score = (found_count / found_total) if found_total else None
+
+    border_score = _linear_good_bad_score(
+        float(border_reached_count) if border_reached_count is not None else None,
+        0.0, float(settings.performance_border_bad_count),
+    )
+    components = [
+        ("Endpoint proximity", endpoint_score, settings.performance_weight_endpoint, stop_position_distance_m, "m"),
+        ("Target proximity (avg of O1-On)", target_score, settings.performance_weight_target, target_mean_raw, "m"),
+        ("Targets found", found_score, settings.performance_weight_found, found_count, f"of {found_total}" if found_total else ""),
+        ("Border crossings", border_score, settings.performance_weight_border, border_reached_count, "crossings"),
+    ]
+    available = [c for c in components if c[1] is not None]
+    if not available:
+        return {"score": None, "composite": None, "components": [], "target_breakdown": []}
+    weight_sum = sum(w for _, _, w, _, _ in available)
+    composite = sum(score * w for _, score, w, _, _ in available) / weight_sum
+    score_1_5 = max(1, min(5, int(round(1 + composite * 4))))
+    return {
+        "score": score_1_5,
+        "composite": round(composite, 3),
+        "components": [
+            {
+                "name": name,
+                "normalized_score": round(score, 3),
+                "weight": round(weight / weight_sum, 3),
+                "raw_value": _jsonable(raw),
+                "unit": unit,
+            }
+            for name, score, weight, raw, unit in available
+        ],
+        # Per-target breakdown behind the "Target proximity" component above —
+        # exactly "how close did it get to O1 / O2 / O3 individually", shown
+        # in the info popover rather than collapsed into the averaged score.
+        "target_breakdown": [
+            {
+                "target_id": tid,
+                "distance_m": round(d, 3),
+                "normalized_score": round(per_target_scores[tid], 3) if per_target_scores.get(tid) is not None else None,
+                "found": bool(target_found.get(tid, False)),
+            }
+            for tid, d in sorted(target_proximities_m.items())
+        ],
+    }
+
+
+def compute_navigation_metrics(
+    ideal_path_length_m: Optional[float],
+    actual_path_length_m: Optional[float],
+    stop_position_distance_m: Optional[float],
+    target_proximities_m: Dict[str, float],
+    target_found: Dict[str, bool],
+    found_count: Optional[int],
+    found_total: Optional[int],
+    border_reached_count: Optional[int],
+) -> Dict[str, Any]:
+    """Standard individual navigation outcome measures for one exploration
+    attempt, reported separately rather than combined into a single
+    composite score — shown alongside compute_performance_score's 1-5 rating
+    (not in place of it) so the two can be compared: that rating is a
+    heuristic, weighted-by-guesswork index, while every measure below is
+    reported in its own natural unit with no weighting at all. Provenance
+    varies per measure — see each one below; not all are verified as named
+    O&M/blind-mobility-specific terms, just because they're reported here
+    alongside ones that are closer to that domain.
+
+    - path_efficiency_pct: ideal_path_length_m (shortest possible route,
+      straight line start -> O1 -> O2 -> O3 -> stop, in visit order — see
+      compute_trial_metrics) divided by the actual distance traveled, as a
+      percentage. This exact ratio (ideal/actual) is "path efficiency" in
+      Morris water maze spatial-navigation research (rodent studies); human
+      wayfinding research uses the inverse ("path ratio" = actual/ideal,
+      e.g. Fu et al. 2024, PMC11189867). 100% is as short as geometrically
+      possible, lower means more backtracking/wandering. Doesn't account for
+      time, target proximity, or heading accuracy — only total distance
+      covered.
+    - target_acquisition_pct / targets_found / targets_total: fraction of
+      this path's targets actually found (feedback or manual-distance
+      confirmed — see target_discovery). The standard task-success-rate
+      measure in search / assistive-technology studies. A target walked past
+      just outside the activation radius counts as NOT found here, even if
+      target_breakdown below shows it was geometrically close.
+    - endpoint_error_m: distance between the exploration's final tracked
+      position and the learning trajectory's own end point (the intended
+      goal location) — the same "homing error" measure used in classic
+      homing / triangle-completion navigation experiments. Only the final
+      position matters, not the route taken to reach it.
+    - boundary_contacts: number of times the 8x6 m safety perimeter was left
+      — analogous to "veering incidents" / obstacle-contact counts reported
+      in O&M mobility research on blind pedestrian travel. Counts episodes,
+      not how far or how long each excursion was.
+
+    target_breakdown (distance to each target individually, with its own
+    found/not-found flag) is included as supporting detail behind
+    target_acquisition_pct — descriptive, not itself a scored/weighted
+    measure.
+
+    Any measure with no data (e.g. no target ever tracked for this condition
+    and no manual coordinate entered) is simply None/omitted — nothing here
+    is estimated or backfilled.
+    """
+    path_efficiency_pct = (
+        round(100.0 * ideal_path_length_m / actual_path_length_m, 1)
+        if ideal_path_length_m is not None and actual_path_length_m
+        else None
+    )
+    target_acquisition_pct = round(100.0 * found_count / found_total, 1) if found_total else None
+    return {
+        "path_efficiency_pct": path_efficiency_pct,
+        "ideal_path_length_m": _jsonable(round(ideal_path_length_m, 2) if ideal_path_length_m is not None else None),
+        "actual_path_length_m": _jsonable(round(actual_path_length_m, 2) if actual_path_length_m is not None else None),
+        "target_acquisition_pct": target_acquisition_pct,
+        "targets_found": found_count,
+        "targets_total": found_total,
+        "endpoint_error_m": _jsonable(stop_position_distance_m),
+        "boundary_contacts": border_reached_count,
+        # Distance to each target individually — the detail behind
+        # target_acquisition_pct above (see docstring).
+        "target_breakdown": [
+            {
+                "target_id": tid,
+                "distance_m": round(d, 3),
+                "found": bool(target_found.get(tid, False)),
+            }
+            for tid, d in sorted(target_proximities_m.items())
+        ],
+    }
+
+
+@lru_cache(maxsize=1)
+def compute_speed_accel_correlations() -> Dict[str, Any]:
+    """Standalone diagnostic: Pearson correlation, across every trial in the
+    dataset with both a learning and exploration recording, between how the
+    participant moved (mean walking speed, peak IMU acceleration on the
+    seeker tag) and the standard outcome measures in compute_navigation_metrics
+    — distance to the learning route's own end point, average distance to
+    EACH target individually (same per-target metric compute_navigation_metrics
+    uses, not just whichever target happened to be nearest), fraction of
+    targets actually found, and border crossings.
+
+    Purely descriptive — answers "does moving faster/more erratically relate
+    to how the attempt turned out?" across the whole dataset. Not used to
+    weight or adjust any of the navigation metrics above (they're reported
+    individually, unweighted — see compute_navigation_metrics' docstring for
+    why). Cached (cleared by /api/refresh) since it scans the whole dataset —
+    expensive to redo per request, and the answer doesn't change between two
+    dropdown clicks.
+
+    Target discovery here is feedback-only (doesn't re-apply per-patient
+    manual target coordinates the way compare_trials does) — a reasonable
+    simplification for a dataset-wide diagnostic that only affects the small
+    number of trials under the haptic_on_object_intes condition.
+
+    Trials flagged "excluded from statistics" (hardware error / bad trial)
+    are skipped — a descriptive dataset-wide statistic shouldn't be built on
+    data already marked untrustworthy.
+    """
+    trials_df = build_trials_df()
+    if trials_df.empty:
+        return {"n": 0, "correlations": {}}
+    sessions_df = get_sessions_df()
+    speeds: List[float] = []
+    accels: List[float] = []
+    endpoints: List[float] = []
+    targets: List[float] = []
+    founds: List[float] = []
+    borders: List[float] = []
+    for _, r in trials_df.iterrows():
+        if pd.isna(r["learning_session_id"]) or pd.isna(r["exploration_session_id"]):
+            continue
+        learning_id = int(r["learning_session_id"])
+        exploration_id = int(r["exploration_session_id"])
+        annotation = get_annotation(r["patient"], r["condition"], r["path_id"], exploration_id)
+        if annotation.get("excluded_from_stats"):
+            continue
+        try:
+            trial_metrics = load_trial_metrics(learning_id, exploration_id)
+            session_metrics = load_session_metrics(exploration_id)
+            events = load_exploration_movement_events(exploration_id)
+            target_proximities = compute_target_proximity(exploration_id)
+        except Exception:
+            continue
+        speed = session_metrics.get("mean_speed_m_s")
+        accel = session_metrics.get("max_accel_norm")
+        endpoint = trial_metrics.get("stop_position_distance_m")
+        if speed is None or accel is None or endpoint is None:
+            continue
+        speeds.append(speed)
+        accels.append(accel)
+        endpoints.append(endpoint)
+        targets.append(float(np.mean(list(target_proximities.values()))) if target_proximities else np.nan)
+        target_discovery = trial_metrics.get("target_discovery")
+        founds.append(
+            target_discovery["found_count"] / len(target_discovery["targets"])
+            if target_discovery and target_discovery["targets"] else np.nan
+        )
+        borders.append(events.get("border_reached_count", np.nan))
+
+    def _corr(a: List[float], b: List[float]) -> Optional[float]:
+        av, bv = np.array(a, dtype=float), np.array(b, dtype=float)
+        mask = np.isfinite(av) & np.isfinite(bv)
+        if mask.sum() < 3 or np.std(av[mask]) == 0 or np.std(bv[mask]) == 0:
+            return None
+        return float(np.corrcoef(av[mask], bv[mask])[0, 1])
+
+    return {
+        "n": len(speeds),
+        "correlations": {
+            "speed_vs_endpoint_distance": _corr(speeds, endpoints),
+            "speed_vs_target_distance": _corr(speeds, targets),
+            "speed_vs_targets_found": _corr(speeds, founds),
+            "speed_vs_border_crossings": _corr(speeds, borders),
+            "accel_vs_endpoint_distance": _corr(accels, endpoints),
+            "accel_vs_target_distance": _corr(accels, targets),
+            "accel_vs_targets_found": _corr(accels, founds),
+            "accel_vs_border_crossings": _corr(accels, borders),
+        },
+    }
 
 
 def compare_trials(
@@ -1303,13 +2041,79 @@ def compare_trials(
                 exp_data = load_json_cached(str(exp_row["file_path"]))
                 exp_config = extract_config(exp_data)
                 exp_tracking = session_to_tracking_df(exp_data)
-                speed_df = compute_speed_df(exp_tracking, seeker_id=exp_config["seeker_id"], rolling_window=settings.speed_rolling_window)
-                bbox = compute_room_bbox(exp_config["anchors"])
-                row_out["stop_count"] = compute_stop_events(speed_df)["count"]
-                row_out["border_reached_count"] = compute_border_events(exp_tracking, exp_config["seeker_id"], bbox)["count"]
+
+                movement_events = load_exploration_movement_events(exploration_id)
+                row_out["stop_count"] = movement_events["stop_count"]
+                row_out["border_reached_count"] = movement_events["border_reached_count"]
+
+                session_metrics = load_session_metrics(exploration_id)
+                row_out["mean_speed_m_s"] = session_metrics.get("mean_speed_m_s")
+                row_out["max_accel_norm"] = session_metrics.get("max_accel_norm")
+                row_out["min_closest_distance_m"] = session_metrics.get("min_closest_distance")
+
+                # Manual target coordinates aren't cached (unlike load_trial_metrics
+                # above), so one entered a moment ago is reflected immediately —
+                # no /api/refresh needed. Applied BEFORE the navigation metrics
+                # below so "targets found" and per-target proximity both see it.
+                manual_coords = get_target_coordinates(r["patient"], r["condition"], r["path_id"])
+                exp_xy = None
+                if manual_coords and row_out.get("target_discovery") is not None:
+                    exp_xy = p1_xy(exp_tracking, exp_config["seeker_id"])
+                    row_out["target_discovery"] = apply_manual_target_coords(row_out["target_discovery"], exp_xy, manual_coords)
+
+                # Manual found/in-order flags (same "not cached" reasoning as
+                # the coordinates above) — always win over whatever the
+                # feedback/distance heuristics above just computed.
+                manual_discovery_override = get_manual_discovery_override(r["patient"], r["condition"], r["path_id"])
+                if row_out.get("target_discovery") is not None:
+                    row_out["target_discovery"] = apply_manual_discovery_overrides(row_out["target_discovery"], manual_discovery_override)
+
+                # A trial flagged "excluded from statistics" (hardware error /
+                # bad trial — see the Exclude from statistics checkbox) has no
+                # trustworthy outcome to report: showing metrics anyway would
+                # present numbers the researcher already said not to trust.
+                if row_out["excluded_from_stats"]:
+                    row_out["performance_score"] = None
+                    row_out["performance_score_details"] = None
+                    row_out["nav_metrics"] = None
+                else:
+                    target_discovery = row_out.get("target_discovery")
+                    target_proximities = compute_target_proximity(
+                        exploration_id, exp_xy=exp_xy, manual_coords=manual_coords,
+                    )
+                    target_found = {t["target_id"]: t["found"] for t in target_discovery["targets"]} if target_discovery else {}
+                    found_count = target_discovery.get("found_count") if target_discovery else None
+                    found_total = len(target_discovery["targets"]) if target_discovery else None
+
+                    row_out["performance_score_details"] = compute_performance_score(
+                        row_out.get("stop_position_distance_m"),
+                        target_proximities,
+                        target_found,
+                        found_count,
+                        found_total,
+                        row_out["border_reached_count"],
+                    )
+                    row_out["performance_score"] = row_out["performance_score_details"]["score"]
+
+                    row_out["nav_metrics"] = compute_navigation_metrics(
+                        row_out.get("ideal_path_length_m"),
+                        session_metrics.get("total_distance_m"),
+                        row_out.get("stop_position_distance_m"),
+                        target_proximities,
+                        target_found,
+                        found_count,
+                        found_total,
+                        row_out["border_reached_count"],
+                    )
             else:
                 row_out["stop_count"] = None
                 row_out["border_reached_count"] = None
+                row_out["mean_speed_m_s"] = None
+                row_out["max_accel_norm"] = None
+                row_out["min_closest_distance_m"] = None
+                row_out["performance_score"] = None
+                row_out["performance_score_details"] = None
+                row_out["nav_metrics"] = None
         except Exception as exc:
             row_out["error"] = str(exc)
         results.append(row_out)

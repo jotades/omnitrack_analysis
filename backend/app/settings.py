@@ -26,6 +26,12 @@ class Settings(BaseModel):
 
     # Trial metrics: exploration vs. learning trajectory comparison.
     trial_overlap_buffer_m: float = 0.5
+    # Shape overlap: both trajectories resampled to this many points, equally
+    # spaced by arc length (not by sample/time — walking speed differs), then
+    # compared point-by-point at the same relative position along the route.
+    # Same trial_overlap_buffer_m threshold, but this respects order/direction,
+    # unlike the plain nearest-neighbor overlap_pct above.
+    trial_shape_resample_points: int = 100
     stop_speed_threshold_m_s: float = 0.08
     stop_min_duration_s: float = 1.0
     # Turn-deviation beyond this angle counts as "wrong" even if a turn was detected at all.
@@ -54,6 +60,62 @@ class Settings(BaseModel):
         "PATIENT_INCLUSION_PATH",
         str(Path(__file__).resolve().parent / "patient_inclusion.json"),
     ))
+
+    # Manually-entered O1/O2/O3 coordinates for trials whose target tags were
+    # never tracked by the sensors (e.g. haptic_on_object_intes only tracked
+    # P1) — same small-JSON-file pattern as the two paths above.
+    target_coordinates_path: Path = Path(os.getenv(
+        "TARGET_COORDINATES_PATH",
+        str(Path(__file__).resolve().parent / "target_coordinates.json"),
+    ))
+    # A manually-placed target counts as "found" (distance-based fallback,
+    # used only when no feedback event confirms it) once the seeker's
+    # trajectory comes within this radius of the entered coordinate.
+    manual_target_found_radius_m: float = 1.0
+
+    # Corrects a session mislabeled learning/exploration at recording time
+    # (experimenter picked the wrong phase when starting the recording) —
+    # keyed by file_name (stable across session_id renumbering on refresh),
+    # same small-JSON-file pattern as the three paths above. Never edits the
+    # raw session JSON files themselves.
+    phase_overrides_path: Path = Path(os.getenv(
+        "PHASE_OVERRIDES_PATH",
+        str(Path(__file__).resolve().parent / "phase_overrides.json"),
+    ))
+
+    # Manual found/in-order override per trial — for when the automatic
+    # feedback/distance-based detection (target_coordinates_path above) gets
+    # it wrong, mainly under haptic_on_object_intes where there's no sensor
+    # on O1/O2/O3 to derive it from. Same small-JSON-file pattern as the
+    # paths above; keyed the same way as target_coordinates_path.
+    manual_discovery_path: Path = Path(os.getenv(
+        "MANUAL_DISCOVERY_PATH",
+        str(Path(__file__).resolve().parent / "manual_discovery.json"),
+    ))
+
+    # Performance score (1-5, compute_performance_score): a heuristic composite
+    # of how well one exploration attempt achieved the stated goal — end up as
+    # close as possible to the learning route's own end point and to EACH
+    # target individually (O1-O3), have actually found them (not just walked
+    # near them), without repeatedly leaving the 8x6 m safety border. NOT a
+    # validated formula — see compute_navigation_metrics for the same facts
+    # reported as individually-established O&M measures instead, for
+    # comparison. Endpoint/target distances are linearly scored 1.0 at/below
+    # their "good" reference down to 0.0 at/above their "bad" reference (see
+    # _linear_good_bad_score); "targets found" is already a 0-1 fraction
+    # (found_count / found_total). Speed/acceleration are deliberately NOT in
+    # this formula — see compute_speed_accel_correlations, which checks
+    # whether they actually relate to outcome before anything gets weighted
+    # by them.
+    performance_endpoint_good_m: float = 0.5
+    performance_endpoint_bad_m: float = 3.0
+    performance_target_good_m: float = 0.5
+    performance_target_bad_m: float = 3.0
+    performance_border_bad_count: int = 5
+    performance_weight_endpoint: float = 0.30
+    performance_weight_target: float = 0.25
+    performance_weight_found: float = 0.25
+    performance_weight_border: float = 0.20
 
 
 @lru_cache(maxsize=1)
