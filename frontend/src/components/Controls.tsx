@@ -21,7 +21,6 @@ interface Props {
   onSmoothTrajectory: (value: boolean) => void;
   onShowCookedOverlay: (value: boolean) => void;
   onSmoothOnlySeeker: (value: boolean) => void;
-  onRefresh: () => void;
 }
 
 function unique<T>(values: T[]): T[] {
@@ -139,7 +138,6 @@ export function Controls(props: Props) {
             <label><input type="checkbox" checked={props.smoothTrajectory} onChange={(e) => props.onSmoothTrajectory(e.target.checked)} /> Smooth 2D offline</label>
             <label><input type="checkbox" checked={props.showCookedOverlay} onChange={(e) => props.onShowCookedOverlay(e.target.checked)} /> Cooked overlay α=0.4</label>
             <label><input type="checkbox" checked={props.smoothOnlySeeker} onChange={(e) => props.onSmoothOnlySeeker(e.target.checked)} /> Smooth seeker P1 only</label>
-            <button type="button" onClick={props.onRefresh}>Refresh index</button>
           </div>
         </section>
       </aside>

@@ -389,6 +389,7 @@ button:hover { opacity: 0.9; }
 .metricCard span { color: var(--muted); font-size: 0.82rem; font-weight: 700; }
 .metricCard strong { font-size: clamp(1.35rem, 3vw, 2rem); letter-spacing: -0.04em; }
 .metricCard .metricSub { font-size: 0.72rem; font-weight: 600; opacity: 0.7; }
+.metricCard .outOfTotal { font-size: 0.55em; font-weight: 600; opacity: 0.55; margin-left: 3px; }
 .metricIcon { color: var(--accent); }
 
 /* Masonry-style packing (CSS multi-column, not CSS Grid): cards size to their
@@ -432,6 +433,132 @@ button:hover { opacity: 0.9; }
 .miniStatGrid strong { font-size: 0.8rem; }
 .miniStatInfo { display: inline-flex; cursor: help; opacity: 0.6; }
 .miniStatInfo:hover { opacity: 1; }
+
+.miniPerformanceRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--time-badge-bg, transparent);
+}
+.miniPerformanceLabel {
+  font-size: 0.62rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.miniPerformanceStars { color: var(--accent2); letter-spacing: 1px; font-size: 0.95rem; margin-left: auto; }
+.miniPerformanceStarsEmpty { color: var(--border); }
+.miniPerformanceValue { font-size: 0.8rem; }
+
+.miniNavRow { flex-wrap: wrap; }
+.miniNavStats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-left: auto;
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+.miniNavStats strong { color: var(--text); margin-left: 3px; font-size: 0.75rem; }
+
+.statInfoTrigger { display: inline-flex; cursor: help; opacity: 0.6; outline: none; }
+.statInfoTrigger:hover, .statInfoTrigger:focus-visible { opacity: 1; }
+
+.statInfoCard {
+  position: fixed;
+  z-index: 1000;
+  max-height: min(70vh, 520px);
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--text);
+}
+.statInfoCard h4 { margin: 0 0 6px; font-size: 0.95rem; color: var(--ink); }
+.statInfoCard > p:first-of-type { margin-top: 0; }
+.statInfoCard p { margin: 6px 0; color: var(--text); }
+.statInfoCard .statInfoIntro { color: var(--muted); font-size: 0.76rem; margin: 0 0 10px; }
+.statInfoCard a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+
+.statInfoSection { margin: 12px 0; }
+.statInfoSection:first-of-type { margin-top: 0; }
+.statInfoSection h5 {
+  margin: 0 0 6px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.statInfoSection p { margin: 4px 0; }
+.statInfoSection ul { margin: 4px 0; padding-left: 18px; }
+.statInfoSection li { margin: 3px 0; }
+
+.texFormulaWrap { position: relative; display: block; margin: 6px 0; }
+.texFormula {
+  display: block;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 34px 8px 12px;
+  overflow-x: auto;
+}
+/* KaTeX renders black glyphs by default — recolor to the theme's text color
+ * so formulas stay legible in dark mode too. */
+.texFormula .katex { color: var(--text); }
+
+.texCopyBtn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.texFormulaWrap:hover .texCopyBtn,
+.texCopyBtn:focus-visible { opacity: 1; }
+.texCopyBtn:hover { color: var(--accent); border-color: var(--accent); }
+
+.copyPngBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.copyPngBtn:hover { color: var(--accent); border-color: var(--accent); }
+.copyPngRow { display: flex; justify-content: flex-end; gap: 8px; padding: 0 4px; }
+
+.statInfoMetricList { display: flex; flex-direction: column; gap: 10px; }
+.statInfoMetricList .metricName { font-weight: 700; color: var(--ink); }
 .miniLostBadge { margin-top: 8px; display: inline-flex; }
 
 .cardHeader {
@@ -639,6 +766,13 @@ button:hover { opacity: 0.9; }
   min-width: 0;
   background: var(--surface);
 }
+/* Condition color-coding: 2 colors (audio = --accent, haptic = --accent2),
+ * crossed with 2 treatments — on_object gets an outline only, on_person
+ * tints the whole card — so all 4 conditions read apart at a glance. */
+.miniTrajCard.condAudioObject { border-color: var(--accent); border-width: 2px; }
+.miniTrajCard.condHapticObject { border-color: var(--accent2); border-width: 2px; }
+.miniTrajCard.condAudioPerson { border-color: var(--accent); border-width: 2px; background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
+.miniTrajCard.condHapticPerson { border-color: var(--accent2); border-width: 2px; background: color-mix(in srgb, var(--accent2) 12%, var(--surface)); }
 .miniTrajTitle { display: flex; flex-direction: column; gap: 1px; }
 .miniTrajTitle strong { font-size: 0.86rem; letter-spacing: -0.01em; }
 .miniTrajTitle span { color: var(--muted); font-size: 0.78rem; font-weight: 700; }
@@ -655,6 +789,18 @@ button:hover { opacity: 0.9; }
 .miniTrajPhase i { width: 10px; height: 3px; border-radius: 2px; flex: none; }
 .miniTrajPhase em { font-style: normal; opacity: 0.8; }
 .miniTrajPhase select { font-size: 0.75rem; min-height: 22px; padding: 0 4px; }
+.miniPhaseSwap { display: inline-flex; align-items: center; gap: 6px; flex-basis: 100%; margin-top: 2px; }
+.miniPhaseSwapBtn {
+  font-size: 0.72rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+}
+.miniPhaseSwapBtn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.miniPhaseSwapBtn:disabled { opacity: 0.6; cursor: default; }
 .miniTrajEmpty {
   flex: 1;
   display: flex;
@@ -679,6 +825,9 @@ button:hover { opacity: 0.9; }
   padding-bottom: 10px;
 }
 .miniAlphaLabel input[type="range"] { width: 90px; }
+.miniDeviationChart { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.miniDeviationChartTitle { display: flex; align-items: center; gap: 4px; font-size: 0.75rem; font-weight: 600; color: var(--muted); margin-bottom: 4px; }
+.combinedDeviationChart { margin-bottom: 12px; }
 .miniAnnotation { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
 .miniAnnotation select { font-size: 0.75rem; min-height: 26px; padding: 0 6px; align-self: flex-start; }
 .miniExcludeCheck { font-size: 0.75rem; padding-bottom: 0; }
@@ -696,6 +845,54 @@ button:hover { opacity: 0.9; }
 .miniSavingHint { font-size: 0.72rem; color: var(--muted); }
 .miniSavingError { color: var(--bad-fg); }
 
+.linkButton {
+  font: inherit;
+  font-weight: 600;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text);
+  border-bottom: 1px dashed var(--muted);
+}
+.linkButton:hover { color: var(--accent, var(--text)); }
+
+.activationDistanceEditor { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.activationDistanceEditor input {
+  width: 56px;
+  font-size: 0.75rem;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+.activationDistanceEditor button {
+  font-size: 0.72rem;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.miniCoordForm { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.miniCoordFormTitle { display: flex; align-items: center; gap: 4px; font-size: 0.75rem; font-weight: 600; color: var(--muted); }
+.miniCoordRow { display: flex; align-items: center; gap: 6px; }
+.miniCoordRow span { font-size: 0.75rem; width: 20px; flex-shrink: 0; }
+.miniCoordRow input,
+.miniCoordRow select {
+  font-size: 0.75rem;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+.miniCoordRow input { width: 70px; }
+.miniCoordRow select { max-width: 130px; }
+
 @media (max-width: 720px) {
   .miniTrajGrid { grid-template-columns: 1fr; }
 }
@@ -703,6 +900,7 @@ button:hover { opacity: 0.9; }
 .tableCard { overflow: hidden; }
 .tableWrap { overflow: auto; padding: 14px 18px 18px; }
 .tableWrap.compact { max-height: 380px; }
+.tableWrap.tall { max-height: 760px; }
 table { border-collapse: collapse; width: 100%; min-width: 850px; font-size: 0.85rem; }
 th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
 th { position: sticky; top: 0; background: var(--surface); z-index: 1; color: var(--muted); }
@@ -733,6 +931,9 @@ td { color: var(--text); }
 .behavioralSubcard h3 { margin: 0 0 8px; font-size: 0.92rem; }
 .behavioralSubcard .miniHint { margin: 0 0 8px; }
 .miniTable { min-width: 0; font-size: 0.82rem; }
+.completionOrderCell { font-size: 0.75rem; color: var(--muted); line-height: 1.5; }
+.miniHintInline { font-size: 0.72rem; color: var(--muted); }
+.pathDot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
 .miniTable th, .miniTable td { padding: 6px 8px; }
 .miniTable th { position: static; background: none; }
 
@@ -1031,7 +1232,8 @@ td { color: var(--text); }
 .comparisonOptionsRow .inlineCheck { padding-bottom: 0; }
 
 .timeBadge,
-.warningBadge {
+.warningBadge,
+.okBadge {
   display: inline-flex;
   align-items: center;
   border-radius: 999px;
@@ -1039,6 +1241,11 @@ td { color: var(--text); }
   font-size: 0.82rem;
   line-height: 1;
   white-space: nowrap;
+}
+
+.okBadge {
+  background: var(--ok-bg);
+  color: var(--ok-fg);
 }
 
 .timeBadge {

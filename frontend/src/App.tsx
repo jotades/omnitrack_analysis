@@ -59,6 +59,8 @@ function payloadDuration(payload: SessionPayload | null) {
   ]);
 }
 
+const ATTEMPT_CHOICES_STORAGE_KEY = 'omnitrack-attempt-choices';
+
 function sortSessions(rows: SessionRow[]) {
   return [...rows].sort((a, b) => `${a.path_id}-${a.phase}-${a.start_time}`.localeCompare(`${b.path_id}-${b.phase}-${b.start_time}`));
 }
@@ -74,6 +76,7 @@ export default function App() {
   const [payload, setPayload] = useState<SessionPayload | null>(null);
   const [phaseOverlayPayloads, setPhaseOverlayPayloads] = useState<SessionPayload[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [phaseOverlayLoading, setPhaseOverlayLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -193,18 +196,55 @@ export default function App() {
     return () => { cancelled = true; };
   }, [allPatients]);
 
-  const [bulkTrialRows, setBulkTrialRows] = useState<TrialRow[]>([]);
-  const [bulkTrialRowsLoaded, setBulkTrialRowsLoaded] = useState(false);
-  useEffect(() => {
-    if (!allPatients.length) { setBulkTrialRows([]); return; }
-    let cancelled = false;
-    fetchTrialRows({ includeSuspicious: true })
-      .then((rowsResult) => { if (!cancelled) { setBulkTrialRows(rowsResult); setBulkTrialRowsLoaded(true); } })
-      .catch(() => { if (!cancelled) setBulkTrialRowsLoaded(true); });
-    return () => { cancelled = true; };
-  }, [allPatients]);
+  // Trial-level metrics (overlap, Fréchet, DTW, LCSS, turns...) are expensive
+  // to compute per trial — fetching them for every patient up front used to
+  // take minutes on this backend regardless of whether the researcher ever
+  // opened most of those dropdowns. Loaded lazily instead, one patient at a
+  // time, the first time that patient's "Trial metrics" dropdown is opened
+  // (see ensureTrialRows below) — General statistics still needs every
+  // patient, but only fetches whichever ones aren't cached yet, and only
+  // once that tab is actually visited (see the effect further down).
+  const trialRowsCacheRef = useRef<Record<string, TrialRow[]>>({});
+  const [trialRowsVersion, setTrialRowsVersion] = useState(0);
+  const trialRowsInFlight = useRef<Set<string>>(new Set());
+  const [trialRowsLoadingPatients, setTrialRowsLoadingPatients] = useState<Set<string>>(new Set());
 
-  const bulkDataLoading = !bulkSessionRowsLoaded || !bulkTrialRowsLoaded;
+  const ensureTrialRows = useCallback((patientsToLoad: string[]) => {
+    const missing = patientsToLoad.filter((p) => !(p in trialRowsCacheRef.current) && !trialRowsInFlight.current.has(p));
+    if (!missing.length) return;
+    missing.forEach((p) => trialRowsInFlight.current.add(p));
+    setTrialRowsLoadingPatients((prev) => new Set([...prev, ...missing]));
+    fetchTrialRows({ patients: missing, includeSuspicious: true })
+      .then((rows) => {
+        for (const p of missing) trialRowsCacheRef.current[p] = rows.filter((r) => r.patient === p);
+      })
+      .catch(() => {
+        // Mark as attempted (empty) so a persistent error doesn't retry forever on re-render.
+        for (const p of missing) trialRowsCacheRef.current[p] = trialRowsCacheRef.current[p] ?? [];
+      })
+      .finally(() => {
+        missing.forEach((p) => trialRowsInFlight.current.delete(p));
+        setTrialRowsLoadingPatients((prev) => { const next = new Set(prev); missing.forEach((p) => next.delete(p)); return next; });
+        setTrialRowsVersion((v) => v + 1);
+      });
+  }, []);
+
+  const bulkTrialRows = useMemo(
+    () => Object.values(trialRowsCacheRef.current).flat(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [trialRowsVersion],
+  );
+
+  const bulkDataLoading = !bulkSessionRowsLoaded;
+
+  // General statistics combines totals across every included patient, so —
+  // unlike the Trial metrics tab — it genuinely needs everyone's trial rows.
+  // Fetched lazily too: only once this tab is actually visited, and only for
+  // whichever patients aren't already cached (e.g. from dropdowns already
+  // opened in Trial metrics).
+  useEffect(() => {
+    if (analysisMode === 'general' && allPatients.length) ensureTrialRows(allPatients);
+  }, [analysisMode, allPatients, ensureTrialRows]);
 
   // Per-patient opt-out from General statistics, persisted on the backend —
   // the save call itself lives in TrialsPanel (next to the checkbox), this
@@ -224,6 +264,30 @@ export default function App() {
   const [excludedTrialOverrides, setExcludedTrialOverrides] = useState<Record<string, boolean>>({});
   const setTrialExcluded = useCallback((patient: string, condition: string, pathId: string, explorationSessionId: number | null, excluded: boolean) => {
     setExcludedTrialOverrides((prev) => ({ ...prev, [`${patient}|${condition}|${pathId}|${explorationSessionId ?? 'none'}`]: excluded }));
+  }, []);
+
+  // Which specific recording (learning or exploration) is picked per
+  // patient/condition/path/phase in the Trial metrics mini-card dropdowns —
+  // lifted here (not left local to ConditionTrajectoriesGrid) so it survives
+  // that grid unmounting when its dropdown closes, AND so General statistics
+  // can use the SAME manually-picked attempt instead of silently defaulting
+  // to "latest" or "shortest" and overriding what the researcher chose.
+  // Persisted to localStorage so the researcher doesn't have to reselect
+  // the correct learning/exploration recording every time the page reloads.
+  const [attemptChoices, setAttemptChoicesState] = useState<Record<string, number>>(() => {
+    try {
+      const raw = localStorage.getItem(ATTEMPT_CHOICES_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+  const setAttemptChoice = useCallback((patient: string, condition: string, pathId: string, phase: string, sessionId: number) => {
+    setAttemptChoicesState((prev) => {
+      const next = { ...prev, [`${patient}|${condition}|${pathId}|${phase}`]: sessionId };
+      try { localStorage.setItem(ATTEMPT_CHOICES_STORAGE_KEY, JSON.stringify(next)); } catch { /* private mode etc. */ }
+      return next;
+    });
   }, []);
 
   const filteredSessions = useMemo(() => {
@@ -338,6 +402,17 @@ export default function App() {
     return () => controller.abort();
   }, [selectedPatient, selectedCondition, selectedPath]);
 
+  // Target waypoints in visit order (O1 -> O2 -> O3) for the "Ideal path"
+  // toggle on the single-session 2D room trajectory chart — whichever trial
+  // row the currently viewed session (learning or exploration) belongs to.
+  // Start/stop left out for now (no trustworthy coordinates yet).
+  const idealPathPoints = useMemo((): [number, number][] | null => {
+    const row = sessionTrialRows.find((r) => r.exploration_session_id === selectedSessionId || r.learning_session_id === selectedSessionId)
+      ?? sessionTrialRows[0] ?? null;
+    if (!row?.turns?.length) return null;
+    return [...row.turns].sort((a, b) => a.turn_index - b.turn_index).map((t): [number, number] => [t.x, t.y]);
+  }, [sessionTrialRows, selectedSessionId]);
+
   const phaseOverlaySessionIds = useMemo(() => {
     if (!currentSession) return [] as number[];
     const sameBlock = sortSessions(
@@ -393,11 +468,14 @@ export default function App() {
 
   async function handleRefresh() {
     setError(null);
+    setRefreshing(true);
     try {
       await refreshIndex();
       await loadSessions();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRefreshing(false);
     }
   }
 
@@ -422,6 +500,16 @@ export default function App() {
           </p>
         </div>
         <div className="heroSide">
+          <button
+            type="button"
+            className="themeToggle"
+            onClick={handleRefresh}
+            disabled={refreshing}
+            title="Re-scan the data directory on disk — needed after a phase swap or any other file-level change, since session data is cached until this is pressed"
+          >
+            <RefreshCw size={17} className={refreshing ? 'spin' : undefined} />
+            Refresh index
+          </button>
           <button
             type="button"
             className="themeToggle"
@@ -503,7 +591,6 @@ export default function App() {
           onSmoothTrajectory={setSmoothTrajectory}
           onShowCookedOverlay={setShowCookedOverlay}
           onSmoothOnlySeeker={setSmoothOnlySeeker}
-          onRefresh={handleRefresh}
         />
       ) : null}
 
@@ -518,12 +605,15 @@ export default function App() {
           sessionRows={bulkSessionRows}
           allTrialRows={bulkTrialRows}
           patientSummaries={patientSummaries}
-          dataLoading={bulkDataLoading}
+          loadingPatients={trialRowsLoadingPatients}
+          onRequestTrialRows={ensureTrialRows}
           onRefreshPatientSummaries={refreshPatientSummaries}
           inclusion={inclusion}
           onSetInclusion={setInclusion}
           excludedTrialOverrides={excludedTrialOverrides}
           onSetTrialExcluded={setTrialExcluded}
+          attemptChoices={attemptChoices}
+          onSetAttemptChoice={setAttemptChoice}
         />
       </div>
       <div className={analysisMode === 'general' ? undefined : 'hiddenPanel'}>
@@ -533,8 +623,9 @@ export default function App() {
           trialRows={bulkTrialRows}
           patientSummaries={patientSummaries}
           inclusion={inclusion}
-          dataLoading={bulkDataLoading}
+          dataLoading={bulkDataLoading || trialRowsLoadingPatients.size > 0}
           excludedTrialOverrides={excludedTrialOverrides}
+          attemptChoices={attemptChoices}
         />
       </div>
       {analysisMode === 'single' ? (
@@ -570,6 +661,7 @@ export default function App() {
                 onCursorTime={handleCursorTime}
                 phaseOverlayPayloads={phaseOverlayPayloads}
                 onShowPhaseOverlay={setShowPhaseOverlay}
+                idealPath={idealPathPoints}
               />
               <div className="statsStack">
                 <SessionTrialMetricsCard

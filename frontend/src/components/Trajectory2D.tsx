@@ -22,6 +22,9 @@ const phasePalette: Record<string, string> = {
   exploration: '#f79009',
 };
 const BORDER_COLOR = '#f79009';
+// Same color used for this overlay in the Trial metrics mini-cards, so it
+// reads as "the same thing" wherever it appears.
+const IDEAL_PATH_COLOR = '#a3379e';
 // Centered "safe" inner box used for the border_reached_count trial metric:
 // margin on the longer anchor-span axis, shorter margin on the other — mirrors
 // the backend's compute_border_events exactly (see analysis.py).
@@ -38,6 +41,10 @@ interface Trajectory2DProps {
   onCursorTime?: (time: number) => void;
   phaseOverlayPayloads?: SessionPayload[];
   onShowPhaseOverlay?: (enabled: boolean) => void;
+  /** The straight-line reference route (start -> O1 -> O2 -> O3 -> stop) now
+   * used for turn-deviation scoring, in raw room coordinates — same overlay
+   * as the "Ideal path" toggle in the Trial metrics mini-cards. */
+  idealPath?: [number, number][] | null;
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -187,6 +194,7 @@ export function Trajectory2D({
   onCursorTime,
   phaseOverlayPayloads = [],
   onShowPhaseOverlay,
+  idealPath,
 }: Trajectory2DProps) {
   const [roomPreset, setRoomPreset] = useState<RoomPreset>('8x12');
   const [showAllTags, setShowAllTags] = useState(true);
@@ -198,6 +206,8 @@ export function Trajectory2D({
   const [showBorder, setShowBorder] = useState(false);
   const [showAnchors, setShowAnchors] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
+  // Off by default — same as the mini-card toggle, a new/unvalidated overlay.
+  const [showIdealPath, setShowIdealPath] = useState(false);
   const hoverAreaRef = useRef<HTMLDivElement | null>(null);
   const preHoverTimeRef = useRef<number | null>(null);
 
@@ -260,6 +270,14 @@ export function Trajectory2D({
       })
       .filter((p): p is { tag_id: string; xRaw2d: number; yRaw2d: number; x2d: number; y2d: number } => p !== null);
   }, [payload.config.anchors, roomX, roomY, rotate90]);
+  const idealPathDisplay = useMemo(() => {
+    if (!showIdealPath || !idealPath || idealPath.length < 2) return [];
+    return idealPath.map(([x, y], i) => {
+      const t = transformPoint(x, y, roomX, roomY, rotate90);
+      return { xRaw2d: x, yRaw2d: y, x2d: t.x2d, y2d: t.y2d, tag_id: i === 0 ? 'start' : i === idealPath.length - 1 ? 'stop' : `waypoint ${i}` };
+    });
+  }, [showIdealPath, idealPath, roomX, roomY, rotate90]);
+
   const computedDuration = duration ?? payload.metrics.duration_s ?? Math.max(0, ...payload.tracking.map((p) => p.t_s).filter(isFiniteNumber));
   const t = clampTime(playbackTime, computedDuration);
   const seeker = payload.config.seeker_id;
@@ -367,6 +385,7 @@ export function Trajectory2D({
     ...(cooked.length ? [{ name: `${seeker} cooked α=0.4`, color: '#777' }] : []),
     ...phaseOverlays.map((item) => ({ name: `${item.phase} ${seeker}`, color: item.color, dashed: true })),
     ...(borderBoxDisplay ? [{ name: 'border 8×6 m', color: BORDER_COLOR, dashed: true }] : []),
+    ...(idealPathDisplay.length ? [{ name: 'ideal path (start→O→O→O→stop)', color: IDEAL_PATH_COLOR, dashed: true }] : []),
   ];
 
   const pointsOutOfRoom = payload.tracking.filter((p) => {
@@ -410,6 +429,12 @@ export function Trajectory2D({
               <input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} />
               Grid 1×1 m
             </label>
+            {idealPath && idealPath.length >= 2 ? (
+              <label className="inlineCheck" title="Percorso ideale a linee rette tra O1 → O2 → O3 (ordine di visita reale) — il riferimento ora usato per il calcolo di Turn dev.">
+                <input type="checkbox" checked={showIdealPath} onChange={(e) => setShowIdealPath(e.target.checked)} />
+                Ideal path
+              </label>
+            ) : null}
             <label>
               Room
               <select value={roomPreset} onChange={(e) => setRoomPreset(e.target.value as RoomPreset)}>
@@ -483,6 +508,18 @@ export function Trajectory2D({
                       stroke={BORDER_COLOR} strokeDasharray="6 4" strokeWidth={1.6}
                       fill={BORDER_COLOR} fillOpacity={0.05}
                       ifOverflow="visible"
+                    />
+                  ) : null}
+
+                  {idealPathDisplay.length ? (
+                    <Scatter
+                      name="ideal path"
+                      data={idealPathDisplay}
+                      line={{ stroke: IDEAL_PATH_COLOR, strokeWidth: 2.2, strokeDasharray: '7 5' }}
+                      lineType="joint"
+                      fill={IDEAL_PATH_COLOR}
+                      fillOpacity={0.5}
+                      isAnimationActive={false}
                     />
                   ) : null}
 

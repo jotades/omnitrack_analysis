@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, RefreshCw } from 'lucide-react';
 import { savePatientInclusion } from '../api';
 import type { CompareRow, PatientTrialSummary, SessionRow, TrialRow } from '../types';
@@ -27,16 +27,24 @@ function trialOverrideKey(patient: string, condition: string, pathId: string, ex
   return `${patient}|${condition}|${pathId}|${explorationSessionId ?? 'none'}`;
 }
 
+/** Same key shape used for the shared attemptChoices map in App.tsx. */
+function attemptChoiceKey(patient: string, condition: string, pathId: string, phase: string) {
+  return `${patient}|${condition}|${pathId}|${phase}`;
+}
+
 /** One collapsible "dropdown" per patient — named after the patient, opens to
- * reveal their learning-vs-exploration grid. Trial rows and session rows are
- * bulk-fetched once for every patient by the parent App (shared with General
- * statistics), so the lost-count, trial aggregate and session totals are all
- * visible on the collapsed header without opening anything — only the
- * mini-chart trajectory rendering (ConditionTrajectoriesGrid's own
- * session-payload fetch) stays lazy. */
+ * reveal their learning-vs-exploration grid. Session rows (cheap) are still
+ * bulk-fetched once for every patient by the parent App, so the session
+ * totals are visible on the collapsed header without opening anything — but
+ * trial rows (expensive: overlap, Fréchet, DTW...) are only requested the
+ * first time THIS patient's dropdown is opened (see the effect below), so
+ * the trial-aggregate tiles and the mini-card grid both start empty/loading
+ * until then. Only the mini-chart trajectory rendering itself
+ * (ConditionTrajectoriesGrid's own session-payload fetch) stays lazy beyond
+ * that, same as before. */
 function PatientTrialSection({
-  patient, sessions, summary, sessionRows, trialRows, trialAggregate, dataLoading, onAnnotationSaved,
-  included, onSetIncluded,
+  patient, sessions, summary, sessionRows, trialRows, trialAggregate, dataLoading, onRequestTrialRows, onAnnotationSaved,
+  included, onSetIncluded, attemptChoices, onSetAttemptChoice,
 }: {
   patient: string;
   sessions: SessionRow[];
@@ -45,12 +53,22 @@ function PatientTrialSection({
   trialRows: TrialRow[];
   trialAggregate?: PatientTrialAggregate;
   dataLoading: boolean;
+  onRequestTrialRows: (patients: string[]) => void;
   onAnnotationSaved?: (info: { condition: string; pathId: string; explorationSessionId: number | null; excludedFromStats: boolean }) => void;
   included: boolean;
   onSetIncluded: (included: boolean) => void;
+  attemptChoices: Record<string, number>;
+  onSetAttemptChoice: (condition: string, pathId: string, phase: string, sessionId: number) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [selectedPhase, setSelectedPhase] = useState<Phase>('exploration');
+
+  // Fetch this patient's trial metrics the first time their dropdown opens —
+  // onRequestTrialRows is a no-op if already cached/in flight, so this is
+  // safe to call again on every reopen.
+  useEffect(() => {
+    if (open) onRequestTrialRows([patient]);
+  }, [open, patient, onRequestTrialRows]);
 
   // Owned here (not inside ConditionTrajectoriesGrid) so the toolbar settings
   // survive closing/reopening the dropdown — the grid itself only mounts
@@ -58,9 +76,24 @@ function PatientTrialSection({
   const [showBorder, setShowBorder] = useState(true);
   const [showAnchors, setShowAnchors] = useState(true);
   const [showGrid, setShowGrid] = useState(true);
+  // Off by default — the ideal path is a new, still-being-validated overlay,
+  // not something to surface unasked on every mini-card.
+  const [showIdealPath, setShowIdealPath] = useState(false);
   const [alpha, setAlpha] = useState(0.2);
   const [smoothTrajectory, setSmoothTrajectory] = useState(true);
   const [smoothOnlySeeker, setSmoothOnlySeeker] = useState(true);
+
+  // ConditionTrajectoriesGrid keys its choices without a patient prefix
+  // (`${condition}|${path}|${phase}`, one instance = one patient) — strip
+  // the patient prefix off the shared, all-patients map from App.tsx.
+  const choicesForPatient = useMemo(() => {
+    const prefix = `${patient}|`;
+    const out: Record<string, number> = {};
+    for (const [key, value] of Object.entries(attemptChoices)) {
+      if (key.startsWith(prefix)) out[key.slice(prefix.length)] = value;
+    }
+    return out;
+  }, [attemptChoices, patient]);
 
   const availability = useMemo(() => ({
     learning: sessionRows.some((r) => r.phase === 'learning'),
@@ -164,12 +197,16 @@ function PatientTrialSection({
             onShowAnchors={setShowAnchors}
             showGrid={showGrid}
             onShowGrid={setShowGrid}
+            showIdealPath={showIdealPath}
+            onShowIdealPath={setShowIdealPath}
             alpha={alpha}
             onAlpha={setAlpha}
             smoothTrajectory={smoothTrajectory}
             onSmoothTrajectory={setSmoothTrajectory}
             smoothOnlySeeker={smoothOnlySeeker}
             onSmoothOnlySeeker={setSmoothOnlySeeker}
+            choices={choicesForPatient}
+            onSetChoice={onSetAttemptChoice}
           />
         </div>
       ) : null}
@@ -182,17 +219,26 @@ interface Props {
   sessionRows: CompareRow[];
   allTrialRows: TrialRow[];
   patientSummaries: PatientTrialSummary[];
-  dataLoading: boolean;
+  /** Patients whose trial-level metrics (overlap, Fréchet, DTW...) are
+   * currently being fetched — see onRequestTrialRows below. */
+  loadingPatients: Set<string>;
+  /** Triggers the (expensive, per-patient) trial-metrics fetch for this
+   * patient — called once, the first time their dropdown is opened, since
+   * fetching this for every patient up front used to take minutes. Cheap to
+   * call again: the parent skips patients it already has cached. */
+  onRequestTrialRows: (patients: string[]) => void;
   onRefreshPatientSummaries: () => void;
   inclusion: Record<string, boolean>;
   onSetInclusion: (patient: string, included: boolean) => void;
   excludedTrialOverrides: Record<string, boolean>;
   onSetTrialExcluded: (patient: string, condition: string, pathId: string, explorationSessionId: number | null, excluded: boolean) => void;
+  attemptChoices: Record<string, number>;
+  onSetAttemptChoice: (patient: string, condition: string, pathId: string, phase: string, sessionId: number) => void;
 }
 
 export function TrialsPanel({
-  sessions, sessionRows, allTrialRows, patientSummaries, dataLoading, onRefreshPatientSummaries,
-  inclusion, onSetInclusion, excludedTrialOverrides, onSetTrialExcluded,
+  sessions, sessionRows, allTrialRows, patientSummaries, loadingPatients, onRequestTrialRows, onRefreshPatientSummaries,
+  inclusion, onSetInclusion, excludedTrialOverrides, onSetTrialExcluded, attemptChoices, onSetAttemptChoice,
 }: Props) {
   // ---------------------------------------------------------------------
   // Trial overview: one collapsible "dropdown" per patient, named after the
@@ -248,12 +294,19 @@ export function TrialsPanel({
       // one row per trial actually run, regardless of how many retries.
       // Attempts flagged excluded_from_stats (hardware error / bad trial) are
       // skipped entirely so an earlier, non-excluded attempt of the same
-      // trial still counts instead.
+      // trial still counts instead. If the researcher manually picked a
+      // specific exploration attempt in the mini-card dropdown, that pick
+      // wins over "latest" — they chose it for a reason.
       const latestByTrial = new Map<string, TrialRow>();
+      const chosenByTrial = new Map<string, TrialRow>();
       for (const r of patientRows) {
         if (r.excluded_from_stats) continue;
-        latestByTrial.set(`${r.condition}|${r.path_id}`, r);
+        const key = `${r.condition}|${r.path_id}`;
+        latestByTrial.set(key, r);
+        const chosenId = attemptChoices[attemptChoiceKey(p, r.condition, r.path_id, 'exploration')];
+        if (chosenId !== undefined && r.exploration_session_id === chosenId) chosenByTrial.set(key, r);
       }
+      for (const [key, row] of chosenByTrial) latestByTrial.set(key, row);
       const validRows = Array.from(latestByTrial.values());
       map.set(p, {
         attemptsLoaded: patientRows.length,
@@ -264,7 +317,7 @@ export function TrialsPanel({
       });
     }
     return map;
-  }, [trialRowsByPatient]);
+  }, [trialRowsByPatient, attemptChoices]);
 
   return (
     <>
@@ -287,7 +340,8 @@ export function TrialsPanel({
             sessionRows={sessionRowsByPatient.get(patient) ?? []}
             trialRows={trialRowsByPatient.get(patient) ?? []}
             trialAggregate={trialAggregateByPatient.get(patient)}
-            dataLoading={dataLoading}
+            dataLoading={loadingPatients.has(patient)}
+            onRequestTrialRows={onRequestTrialRows}
             onAnnotationSaved={(info) => {
               onSetTrialExcluded(patient, info.condition, info.pathId, info.explorationSessionId, info.excludedFromStats);
               onRefreshPatientSummaries();
@@ -297,6 +351,8 @@ export function TrialsPanel({
               onSetInclusion(patient, v);
               savePatientInclusion(patient, v).catch(() => {});
             }}
+            attemptChoices={attemptChoices}
+            onSetAttemptChoice={(condition, pathId, phase, sessionId) => onSetAttemptChoice(patient, condition, pathId, phase, sessionId)}
           />
         ))}
       </div>
