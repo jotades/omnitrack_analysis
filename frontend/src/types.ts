@@ -403,6 +403,46 @@ export interface PerformanceCorrelations {
   };
 }
 
+/** One F-test (Modality, Location, or their interaction) from the two-way
+ * repeated-measures ANOVA — see fetchAnovaResults / compute_anova_results. */
+export interface AnovaEffect {
+  F: number;
+  df_num: number;
+  df_den: number;
+  p: number;
+}
+
+export interface AnovaCellMean {
+  modality: 'auditory' | 'haptic';
+  location: 'on_object' | 'on_person';
+  mean: number;
+  sd: number | null;
+  n: number;
+}
+
+/** One dependent variable's ANOVA result (or insufficient_data=true if fewer
+ * than 4 patients have a complete 2x2 set of cells, or the dataset doesn't
+ * resolve to exactly 4 conditions) — see compute_anova_results' docstring
+ * for the complete-cases rule and why Phase isn't a 3rd factor here. */
+export interface AnovaDvResult {
+  dv: string;
+  label: string;
+  n_patients: number;
+  conditions: string[];
+  insufficient_data: boolean;
+  error?: string;
+  cell_means?: Record<string, AnovaCellMean>;
+  effects?: {
+    modality: AnovaEffect;
+    location: AnovaEffect;
+    interaction: AnovaEffect;
+  };
+}
+
+export interface AnovaResults {
+  dvs: AnovaDvResult[];
+}
+
 export interface PatientTrialSummary {
   patient: string;
   total_trials: number;

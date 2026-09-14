@@ -1,4 +1,4 @@
-import type { CompareRow, PatientTrialSummary, PerformanceCorrelations, SessionPayload, SessionRow, TrialRow } from './types';
+import type { AnovaResults, CompareRow, PatientTrialSummary, PerformanceCorrelations, SessionPayload, SessionRow, TrialRow } from './types';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '';
 
@@ -11,6 +11,27 @@ async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** Fired whenever a save can change a dataset-wide DERIVED aggregate (ANOVA,
+ * speed/accel correlations) — annotation, target coordinate, manual
+ * discovery override, patient inclusion, or a full /api/refresh. Lets
+ * GeneralStatisticsPanel's ANOVA card re-fetch itself the moment the
+ * relevant data changes, without the caller having to know that panel
+ * exists or thread a callback through App/TrialsPanel/ConditionTrajectoriesGrid.
+ * `patient` is the one whose data changed (omitted for a full refresh) —
+ * listeners that only care about their own bulk trial-row cache can ignore
+ * calls for other patients instead of refetching everyone. */
+type DerivedCacheListener = (patient?: string) => void;
+const derivedCacheListeners = new Set<DerivedCacheListener>();
+export function onDerivedCachesInvalidated(listener: DerivedCacheListener): () => void {
+  derivedCacheListeners.add(listener);
+  return () => derivedCacheListeners.delete(listener);
+}
+export function invalidateDerivedCaches(patient?: string): void {
+  anovaResultsPromise = null;
+  performanceCorrelationsPromise = null;
+  derivedCacheListeners.forEach((l) => l(patient));
+}
+
 export async function fetchSessions(): Promise<SessionRow[]> {
   const data = await getJson<{ sessions: SessionRow[] }>('/api/sessions');
   return data.sessions;
@@ -19,7 +40,7 @@ export async function fetchSessions(): Promise<SessionRow[]> {
 export async function refreshIndex(): Promise<{ ok: boolean; sessions: number }> {
   const res = await fetch(`${API_BASE}/api/refresh`, { method: 'POST' });
   if (!res.ok) throw new Error(await res.text());
-  performanceCorrelationsPromise = null; // backend cache was just cleared too — don't keep serving the stale numbers
+  invalidateDerivedCaches(); // backend cache was just cleared too — don't keep serving the stale numbers
   return res.json();
 }
 
@@ -97,6 +118,22 @@ export function fetchPerformanceCorrelations(): Promise<PerformanceCorrelations>
   return performanceCorrelationsPromise;
 }
 
+/** Two-way repeated-measures ANOVA (Modality x Location, subject=patient)
+ * per dependent variable — same dataset-wide result for every caller, so
+ * it's fetched once (module-level singleton promise, same pattern as
+ * fetchPerformanceCorrelations above) and re-fetched only after /api/refresh
+ * clears the backend's cache. */
+let anovaResultsPromise: Promise<AnovaResults> | null = null;
+export function fetchAnovaResults(): Promise<AnovaResults> {
+  if (!anovaResultsPromise) {
+    anovaResultsPromise = getJson<AnovaResults>('/api/anova').catch((err) => {
+      anovaResultsPromise = null;
+      throw err;
+    });
+  }
+  return anovaResultsPromise;
+}
+
 export async function fetchPatientInclusion(): Promise<Record<string, boolean>> {
   const data = await getJson<{ inclusion: Record<string, boolean> }>('/api/patient-inclusion');
   return data.inclusion;
@@ -110,6 +147,7 @@ export async function savePatientInclusion(patient: string, included: boolean): 
   });
   if (!res.ok) throw new Error(await res.text());
   const data = await res.json();
+  invalidateDerivedCaches(patient); // opting a patient in/out changes ANOVA's complete-case pool
   return data.inclusion;
 }
 
@@ -136,7 +174,9 @@ export async function saveAnnotation(payload: {
     }),
   });
   if (!res.ok) throw new Error(await res.text());
-  return res.json();
+  const result = await res.json();
+  invalidateDerivedCaches(payload.patient); // excluded_from_stats changes who counts in ANOVA/correlations
+  return result;
 }
 
 /** {`${patient}|${condition}|${path_id}`: {target_id: [x, y]}} — manually
@@ -169,6 +209,7 @@ export async function saveTargetCoordinate(payload: {
   });
   if (!res.ok) throw new Error(await res.text());
   const data = await res.json();
+  invalidateDerivedCaches(payload.patient); // a moved target changes proximity/found/path-efficiency downstream
   return data.coordinates;
 }
 
@@ -204,6 +245,7 @@ export async function saveManualTargetFound(payload: {
   });
   if (!res.ok) throw new Error(await res.text());
   const data = await res.json();
+  invalidateDerivedCaches(payload.patient);
   return data.override;
 }
 
@@ -226,6 +268,7 @@ export async function saveManualInOrder(payload: {
   });
   if (!res.ok) throw new Error(await res.text());
   const data = await res.json();
+  invalidateDerivedCaches(payload.patient);
   return data.override;
 }
 

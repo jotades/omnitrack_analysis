@@ -7,6 +7,7 @@ import {
   fetchSessions,
   fetchTrialRows,
   fetchTrialsSummary,
+  onDerivedCachesInvalidated,
   refreshIndex,
 } from './api';
 import type { CompareRow, PatientTrialSummary, SessionPayload, SessionRow, TrialRow } from './types';
@@ -88,7 +89,21 @@ export default function App() {
   const [selectedCondition, setSelectedCondition] = useState('');
   const [selectedPhase, setSelectedPhase] = useState('learning');
   const [selectedPath, setSelectedPath] = useState('');
-  const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
+  // The backend's session_id is just the current sort position in the
+  // sessions dataframe (np.arange in build_sessions_index_cached) — it gets
+  // reassigned from scratch on every /api/refresh or server restart, so the
+  // SAME number can silently point to a different physical recording
+  // afterward. selectedFileNameRef tracks which file the researcher
+  // actually picked (file_name is stable — same convention already used by
+  // phase_overrides/annotations) so the reconciliation effect below can
+  // re-resolve the id after a renumbering instead of quietly keeping
+  // whatever session now happens to sit at that old position.
+  const [selectedSessionId, setSelectedSessionIdRaw] = useState<number | null>(null);
+  const selectedFileNameRef = useRef<string | null>(null);
+  const setSelectedSessionId = useCallback((id: number | null) => {
+    selectedFileNameRef.current = id === null ? null : (sessions.find((s) => s.session_id === id)?.file_name ?? selectedFileNameRef.current);
+    setSelectedSessionIdRaw(id);
+  }, [sessions]);
 
   const [alpha, setAlpha] = useState(0.2);
   const [smoothTrajectory, setSmoothTrajectory] = useState(true);
@@ -229,6 +244,20 @@ export default function App() {
       });
   }, []);
 
+  // A save elsewhere (target coordinate, manual found/in-order override,
+  // annotation, patient inclusion) can change this ONE patient's trial
+  // metrics — drop just their cached rows and re-fetch them, instead of
+  // requiring a full page reload before General statistics reflects it.
+  // (A full /api/refresh — no `patient` argument — is already handled by
+  // handleRefresh's own loadSessions() call below, so it's ignored here.)
+  useEffect(() => {
+    return onDerivedCachesInvalidated((patient) => {
+      if (!patient) return;
+      delete trialRowsCacheRef.current[patient];
+      ensureTrialRows([patient]);
+    });
+  }, [ensureTrialRows]);
+
   const bulkTrialRows = useMemo(
     () => Object.values(trialRowsCacheRef.current).flat(),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -274,7 +303,22 @@ export default function App() {
   // to "latest" or "shortest" and overriding what the researcher chose.
   // Persisted to localStorage so the researcher doesn't have to reselect
   // the correct learning/exploration recording every time the page reloads.
-  const [attemptChoices, setAttemptChoicesState] = useState<Record<string, number>>(() => {
+  //
+  // Stored by file_name, NOT session_id: the backend's session_id is just
+  // the current sort position in the sessions dataframe (np.arange in
+  // build_sessions_index_cached) and gets reassigned on every /api/refresh
+  // or server restart — a raw id saved yesterday can silently mean a
+  // DIFFERENT recording today (same failure mode as selectedSessionId
+  // above, but worse here since it survives across browser sessions via
+  // localStorage). file_name is stable, same convention already used by
+  // phase_overrides/annotations. attemptChoices below is the resolved
+  // session_id view every existing consumer (TrialsPanel,
+  // GeneralStatisticsPanel, ConditionTrajectoriesGrid) already expects —
+  // re-derived fresh from the CURRENT `sessions` list on every render, so
+  // none of them need to change. A stale pre-fix entry (numeric value under
+  // the old format) simply fails to resolve to any file_name and is
+  // dropped — safe no-op, not a silently-wrong match.
+  const [attemptChoiceFiles, setAttemptChoiceFilesState] = useState<Record<string, string>>(() => {
     try {
       const raw = localStorage.getItem(ATTEMPT_CHOICES_STORAGE_KEY);
       return raw ? JSON.parse(raw) : {};
@@ -283,12 +327,23 @@ export default function App() {
     }
   });
   const setAttemptChoice = useCallback((patient: string, condition: string, pathId: string, phase: string, sessionId: number) => {
-    setAttemptChoicesState((prev) => {
-      const next = { ...prev, [`${patient}|${condition}|${pathId}|${phase}`]: sessionId };
+    const fileName = sessions.find((s) => s.session_id === sessionId)?.file_name;
+    if (!fileName) return;
+    setAttemptChoiceFilesState((prev) => {
+      const next = { ...prev, [`${patient}|${condition}|${pathId}|${phase}`]: fileName };
       try { localStorage.setItem(ATTEMPT_CHOICES_STORAGE_KEY, JSON.stringify(next)); } catch { /* private mode etc. */ }
       return next;
     });
-  }, []);
+  }, [sessions]);
+  const attemptChoices = useMemo(() => {
+    const idByFileName = new Map(sessions.map((s) => [s.file_name, s.session_id]));
+    const resolved: Record<string, number> = {};
+    for (const [key, fileName] of Object.entries(attemptChoiceFiles)) {
+      const id = idByFileName.get(fileName);
+      if (id !== undefined) resolved[key] = id;
+    }
+    return resolved;
+  }, [attemptChoiceFiles, sessions]);
 
   const filteredSessions = useMemo(() => {
     return sortSessions(
@@ -305,10 +360,24 @@ export default function App() {
       if (selectedSessionId !== null) setSelectedSessionId(null);
       return;
     }
+    // Re-resolve by file first — after a /api/refresh (or a --reload
+    // restart) the numeric session_id can be reassigned to a DIFFERENT
+    // physical recording (see selectedFileNameRef above), so "the id is
+    // still present in the list" is not proof it still means what the
+    // researcher picked. Only fall back to "first in the new list" when
+    // the previously selected file genuinely isn't here anymore (e.g. the
+    // patient/condition/phase/path filters themselves just changed).
+    const byFile = selectedFileNameRef.current
+      ? filteredSessions.find((s) => s.file_name === selectedFileNameRef.current)
+      : undefined;
+    if (byFile) {
+      if (byFile.session_id !== selectedSessionId) setSelectedSessionIdRaw(byFile.session_id);
+      return;
+    }
     if (selectedSessionId === null || !filteredSessions.some((s) => s.session_id === selectedSessionId)) {
       setSelectedSessionId(filteredSessions[0].session_id);
     }
-  }, [filteredSessions, selectedSessionId]);
+  }, [filteredSessions, selectedSessionId, setSelectedSessionId]);
 
   useEffect(() => {
     if (selectedSessionId === null || analysisMode !== 'single') {

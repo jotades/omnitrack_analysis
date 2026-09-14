@@ -936,6 +936,7 @@ td { color: var(--text); }
 .pathDot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
 .miniTable th, .miniTable td { padding: 6px 8px; }
 .miniTable th { position: static; background: none; }
+.anovaSignificant { color: var(--accent2); font-weight: 700; }
 
 .errorBox {
   padding: 14px 16px;
@@ -1230,6 +1231,20 @@ td { color: var(--text); }
   padding-bottom: 10px;
 }
 .comparisonOptionsRow .inlineCheck { padding-bottom: 0; }
+
+.columnToggleRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  margin-bottom: 8px;
+  font-size: 0.82rem;
+}
+.columnToggleRow .inlineCheck {
+  gap: 5px;
+  padding-bottom: 0;
+  font-size: 0.82rem;
+}
 
 .timeBadge,
 .warningBadge,

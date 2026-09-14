@@ -2,7 +2,7 @@ import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { Area, AreaChart, CartesianGrid, Legend, Line, LineChart, Tooltip, XAxis, YAxis } from 'recharts';
 import {
-  fetchPerformanceCorrelations, fetchSessionDetail, fetchTrialRows, refreshIndex, saveAnnotation,
+  fetchPerformanceCorrelations, fetchSessionDetail, fetchTrialRows, invalidateDerivedCaches, refreshIndex, saveAnnotation,
   saveManualInOrder, saveManualTargetFound, saveTargetCoordinate, swapPhase,
 } from '../api';
 import { ChartFrame } from './ChartFrame';
@@ -1397,6 +1397,11 @@ export function ConditionTrajectoriesGrid({
     const rows = await fetchTrialRows({ patients: [patient], condition, pathId: path, includeSuspicious: true });
     const fresh = rows.find((r) => r.exploration_session_id === formerLearningId) ?? rows[0] ?? null;
     if (fresh) setDiscoveryOverrides((prev) => ({ ...prev, [`${condition}|${path}`]: fresh }));
+    // refreshIndex() already reset the ANOVA/correlations caches, but with no
+    // specific patient — General statistics' own bulk trial-row cache for
+    // THIS patient still needs an explicit nudge (see the App-level
+    // onDerivedCachesInvalidated subscription).
+    invalidateDerivedCaches(patient);
   };
 
   // Smoothing settings changing should drop the stale cache — but every

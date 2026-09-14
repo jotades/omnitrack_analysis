@@ -1,15 +1,16 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle, Crosshair, FileDown, Footprints, Gauge, ListChecks, PauseCircle, Radio, RefreshCw, Route, RotateCw, ShieldAlert, Timer, Users, Zap,
 } from 'lucide-react';
 import { Bar, BarChart, CartesianGrid, Cell, Legend, Line, LineChart, Tooltip, XAxis, YAxis } from 'recharts';
-import type { CompareRow, PatientTrialSummary, SessionRow, TargetDiscovery, TrialRow } from '../types';
-import { fetchBarChartPng } from '../api';
+import type { AnovaResults, CompareRow, PatientTrialSummary, SessionRow, TargetDiscovery, TrialRow } from '../types';
+import { fetchAnovaResults, fetchBarChartPng, onDerivedCachesInvalidated } from '../api';
 import { avgBy, fmtNum, maxBy, stdDevBy, sumBy } from '../lib/aggregate';
 import { ChartFrame } from './ChartFrame';
-import { CopyAsPngButton, InfoPopover } from './InfoPopover';
+import { CopyAsPngButton, InfoPopover, Tex } from './InfoPopover';
 
 const accent = '#3b5bfd';
+const accentCompleteCasesOnly = '#d92d20';
 // One distinct color per path (A..H), reused between the "fastest per path"
 // curve chart and anywhere else path identity needs to be visually stable.
 const PATH_COLORS: Record<string, string> = {
@@ -24,6 +25,17 @@ const CONDITION_COLORS: Record<string, string> = {
   auditory_on_person_intes: '#f79009',
   haptic_on_object_intes: '#12b76a',
   haptic_on_person_intes: '#d92d20',
+};
+
+// Two-line caption under each ANOVA bar chart, keyed by the DV's backend
+// key (see ANOVA_DV_SPECS in analysis.py) — what's actually plotted (one
+// bar = mean across the complete-case patients' per-patient average over
+// that condition's 2 paths) and how to read higher vs. lower bars.
+const DV_CHART_DESCRIPTIONS: Record<string, string> = {
+  path_efficiency_pct: 'Each bar: mean ideal/actual route-length ratio across complete-case patients, one condition at a time. Higher means less backtracking/wandering to reach the targets.',
+  endpoint_error_m: 'Each bar: mean distance between the exploration’s final position and the learning route’s own end point. Lower means the patient homed in more precisely on the taught endpoint.',
+  target_acquisition_pct: 'Each bar: mean fraction of the path’s O1–O3 targets actually found (feedback- or distance-confirmed). Higher means more targets located per trial.',
+  performance_score: 'Each bar: mean 1–5 heuristic composite (endpoint + target proximity + targets found + border crossings). Higher means better overall task performance under that condition.',
 };
 
 interface Props {
@@ -139,6 +151,76 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
     for (const [key, row] of chosen) latest.set(key, row);
     return Array.from(latest.values());
   }, [includedAttempts, attemptChoices]);
+
+  const allConditions = useMemo(() => uniq(sessions.map((s) => s.condition)), [sessions]);
+
+  // Patients with at least one valid trial in EVERY condition — e.g.
+  // haptic_on_object_intes has been excluded/missing for several patients
+  // (no O1/O2/O3 sensor, manual-coordinate fallback), which skews a raw
+  // per-condition comparison: a condition with fewer contributing patients
+  // isn't really being compared against the others, it's a different sample.
+  // "Complete cases only" below restricts several comparisons to patients
+  // present in all conditions, so they reflect the exact same group of people.
+  const completeCasePatients = useMemo(() => {
+    const conditionsByPatient = new Map<string, Set<string>>();
+    for (const r of validTrialRows) {
+      const set = conditionsByPatient.get(r.patient) ?? new Set<string>();
+      set.add(r.condition);
+      conditionsByPatient.set(r.patient, set);
+    }
+    const complete = new Set<string>();
+    for (const [patient, conds] of conditionsByPatient) {
+      if (allConditions.every((c) => conds.has(c))) complete.add(patient);
+    }
+    return complete;
+  }, [validTrialRows, allConditions]);
+
+  const [completeCasesOnly, setCompleteCasesOnly] = useState(false);
+
+  // Dataset-wide ANOVA (Modality x Location, subject=patient) — same
+  // singleton-promise-cached fetch as fetchPerformanceCorrelations, computed
+  // server-side since it needs every trial's navigation metrics regardless
+  // of which patients/conditions happen to be in view here. Also re-fetches
+  // itself whenever a save elsewhere (annotation, target coordinate,
+  // discovery override, patient inclusion, /api/refresh) invalidates the
+  // underlying data — see onDerivedCachesInvalidated in api.ts — so editing
+  // O1/O2/O3 or excluding a trial in Trial metrics updates this card right
+  // away, without a full page reload or a manual "Refresh" click.
+  const [anovaResults, setAnovaResults] = useState<AnovaResults | null>(null);
+  const [anovaError, setAnovaError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      fetchAnovaResults()
+        .then((r) => { if (!cancelled) setAnovaResults(r); })
+        .catch((err) => { if (!cancelled) setAnovaError(err instanceof Error ? err.message : String(err)); });
+    };
+    load();
+    const unsubscribe = onDerivedCachesInvalidated(load);
+    return () => { cancelled = true; unsubscribe(); };
+  }, []);
+
+  // Which columns of "Route shape by condition" to show — hiding one here
+  // also hides it from the "Copy table" PNG export, since that just
+  // rasterizes whatever is actually rendered in qualityTableRef.
+  const [qualityColumnsVisible, setQualityColumnsVisible] = useState({
+    shapeDev: true, frechet: true, overlap: true, n: true,
+  });
+  const toggleQualityColumn = (key: keyof typeof qualityColumnsVisible) =>
+    setQualityColumnsVisible((prev) => ({ ...prev, [key]: !prev[key] }));
+
+  // Shared by every "Complete cases only" toggle across the page (Success by
+  // condition, Proximity escalation, Object impacts by target, Fastest
+  // completion per path/condition) — one flag, applied consistently wherever
+  // it's turned on, instead of a separate filtered set per card.
+  const patientUniverse = useMemo(
+    () => (completeCasesOnly ? includedPatients.filter((p) => completeCasePatients.has(p)) : includedPatients),
+    [completeCasesOnly, includedPatients, completeCasePatients],
+  );
+  const filteredValidTrialRows = useMemo(
+    () => (completeCasesOnly ? validTrialRows.filter((r) => completeCasePatients.has(r.patient)) : validTrialRows),
+    [completeCasesOnly, validTrialRows, completeCasePatients],
+  );
 
   const attemptsLoaded = includedAttempts.length;
 
@@ -294,7 +376,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
   const impactBreakdown = useMemo(() => {
     const patientsWithImpact = new Set<string>();
     const perTarget: Record<string, number> = {};
-    for (const r of validTrialRows) {
+    for (const r of filteredValidTrialRows) {
       const values = Object.values(r.target_impacts ?? {});
       if (values.some((v) => v > 0)) patientsWithImpact.add(r.patient);
       for (const [tid, count] of Object.entries(r.target_impacts ?? {})) {
@@ -302,7 +384,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
       }
     }
     return { patientsWithImpact: patientsWithImpact.size, perTarget };
-  }, [validTrialRows]);
+  }, [filteredValidTrialRows]);
 
   // One row per (patient, condition, path) valid trial — the per-trial detail
   // the aggregated buckets above deliberately hide (they classify each
@@ -316,42 +398,22 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
     [validTrialRows],
   );
 
-  const allConditions = useMemo(() => uniq(sessions.map((s) => s.condition)), [sessions]);
-
-  // Patients with at least one valid trial in EVERY condition — e.g.
-  // haptic_on_object_intes has been excluded/missing for several patients
-  // (no O1/O2/O3 sensor, manual-coordinate fallback), which skews a raw
-  // per-condition comparison: a condition with fewer contributing patients
-  // isn't really being compared against the others, it's a different sample.
-  // "Complete cases only" below restricts the comparison to patients present
-  // in all conditions, so every bar in Success by condition reflects the
-  // exact same group of people.
-  const completeCasePatients = useMemo(() => {
-    const conditionsByPatient = new Map<string, Set<string>>();
-    for (const r of validTrialRows) {
-      const set = conditionsByPatient.get(r.patient) ?? new Set<string>();
-      set.add(r.condition);
-      conditionsByPatient.set(r.patient, set);
-    }
-    const complete = new Set<string>();
-    for (const [patient, conds] of conditionsByPatient) {
-      if (allConditions.every((c) => conds.has(c))) complete.add(patient);
-    }
-    return complete;
-  }, [validTrialRows, allConditions]);
-
-  const [completeCasesOnly, setCompleteCasesOnly] = useState(false);
   // For "Copy as PNG" on the Success-by-condition table/chart — e.g. to
   // paste straight into a slide deck.
   const conditionTableRef = useRef<HTMLDivElement | null>(null);
   const conditionChartRef = useRef<HTMLDivElement | null>(null);
+  const qualityTableRef = useRef<HTMLDivElement | null>(null);
+  const shapeDeviationChartRef = useRef<HTMLDivElement | null>(null);
+  const frechetChartRef = useRef<HTMLDivElement | null>(null);
+  const overlapChartRef = useRef<HTMLDivElement | null>(null);
+  const durationTableRef = useRef<HTMLDivElement | null>(null);
+  const durationChartRef = useRef<HTMLDivElement | null>(null);
 
   // Per condition: how many valid trials found every target ("Found all
   // targets"), out of how many valid trials exist for that condition
   // ("Valid trials"), by how many distinct patients ("Patients").
   const conditionBreakdown = useMemo(() => {
-    const patientUniverse = completeCasesOnly ? includedPatients.filter((p) => completeCasePatients.has(p)) : includedPatients;
-    const rows = completeCasesOnly ? validTrialRows.filter((r) => completeCasePatients.has(r.patient)) : validTrialRows;
+    const rows = filteredValidTrialRows;
     // Same for every condition row (same patient universe, same protocol) —
     // shown per-row anyway so the shortfall from "everyone did every path"
     // is visible right next to that condition's actual numbers.
@@ -390,7 +452,57 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
         };
       })
       .sort((a, b) => a.condition.localeCompare(b.condition));
-  }, [validTrialRows, sessions, includedPatients, allConditions, completeCasesOnly, completeCasePatients]);
+  }, [filteredValidTrialRows, sessions, allConditions, patientUniverse]);
+
+  // Route-shape quality per condition — mean of the same three trial-level
+  // metrics shown on each Trial metrics mini-card (Shape overlap section:
+  // Overlap, Shape dev, Fréchet), averaged over filteredValidTrialRows so it
+  // reacts to "Complete cases only" the same way Success by condition does.
+  const conditionQualityBreakdown = useMemo(() => {
+    const conditions = uniq(sessions.map((s) => s.condition));
+    return conditions.map((condition) => {
+      const rows = filteredValidTrialRows.filter((r) => r.condition === condition);
+      const label = sessions.find((s) => s.condition === condition)?.condition_label || condition;
+      return {
+        condition,
+        label,
+        n: rows.length,
+        shapeDeviationM: avgBy(rows, 'shape_deviation_m'),
+        frechetDistanceM: avgBy(rows, 'frechet_distance_m'),
+        overlapPct: avgBy(rows, 'overlap_pct'),
+      };
+    });
+  }, [filteredValidTrialRows, sessions]);
+
+  // Best/worst per column, to flag the standout condition the same way this
+  // was reported manually — lower is better for the two distance metrics,
+  // higher is better for overlap. Skips columns with no data at all.
+  const qualityExtremes = useMemo(() => {
+    const pick = (key: 'shapeDeviationM' | 'frechetDistanceM' | 'overlapPct', want: 'min' | 'max') => {
+      const withValue = conditionQualityBreakdown.filter((c) => c[key] != null) as Array<typeof conditionQualityBreakdown[number] & Record<typeof key, number>>;
+      if (!withValue.length) return null;
+      return withValue.reduce((best, c) => (want === 'min' ? c[key] < best[key] : c[key] > best[key]) ? c : best).condition;
+    };
+    return {
+      shapeDeviationBest: pick('shapeDeviationM', 'min'),
+      shapeDeviationWorst: pick('shapeDeviationM', 'max'),
+      frechetWorst: pick('frechetDistanceM', 'max'),
+      overlapWorst: pick('overlapPct', 'min'),
+    };
+  }, [conditionQualityBreakdown]);
+
+  // Three separate mini bar charts rather than one grouped chart — shape dev
+  // and Fréchet are in meters, overlap is a percentage, so a single shared
+  // y-axis would misrepresent them.
+  const qualityChartData = useMemo(
+    () => conditionQualityBreakdown.map((c) => ({
+      name: c.label,
+      shapeDeviationM: c.shapeDeviationM ?? 0,
+      frechetDistanceM: c.frechetDistanceM ?? 0,
+      overlapPct: c.overlapPct ?? 0,
+    })),
+    [conditionQualityBreakdown],
+  );
 
   const conditionChartData = useMemo(
     () => conditionBreakdown.map((c) => ({
@@ -413,6 +525,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
         title: 'Success by condition — Found all targets %',
         labels: conditionChartData.map((d) => d.name),
         values: conditionChartData.map((d) => d.successRate),
+        color: completeCasesOnly ? accentCompleteCasesOnly : accent,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -433,7 +546,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
   // target tracking was broken, per compute_target_impacts' caveat below).
   const proximityBreakdown = useMemo(() => {
     const closestByTarget = new Map<string, number>();
-    for (const r of validTrialRows) {
+    for (const r of filteredValidTrialRows) {
       for (const t of r.target_discovery?.targets ?? []) {
         if (t.min_bucket == null) continue;
         const cur = closestByTarget.get(t.target_id);
@@ -444,7 +557,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
     // key: `${target_id}|${condition}`
     const counts = new Map<string, number>();
     if (closestZone != null) {
-      for (const r of validTrialRows) {
+      for (const r of filteredValidTrialRows) {
         for (const t of r.target_discovery?.targets ?? []) {
           if (t.min_bucket === closestZone) {
             const key = `${t.target_id}|${r.condition}`;
@@ -454,7 +567,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
       }
     }
     return { closestZone, counts };
-  }, [validTrialRows]);
+  }, [filteredValidTrialRows]);
 
   // exploration_session_id -> duration_s, to time whichever single attempt
   // validTrialRows picked as each trial's representative (see below).
@@ -471,7 +584,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
   // visible whether a path's completions are broadly spread or a one-off.
   const pathCompletion = useMemo(() => {
     return PATHS.map((pathId) => {
-      const candidates = validTrialRows
+      const candidates = filteredValidTrialRows
         .filter((r) => r.path_id === pathId && r.exploration_session_id != null)
         .map((r) => ({
           patient: r.patient,
@@ -491,9 +604,20 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
       // above is a single best case, this is the actual spread of the path.
       const meanDurationS = avgBy(candidates, 'durationS');
       const stdDevDurationS = stdDevBy(candidates, 'durationS');
-      return { pathId, totalAttempts: candidates.length, patientCount, expectedAttempts: includedPatients.length, completed: completedList, fastest, meanDurationS, stdDevDurationS };
+      // Same trials' LEARNING recordings, as a reference point: was the
+      // exploration attempt faster/slower than the route just taught?
+      const learningCandidates = filteredValidTrialRows
+        .filter((r) => r.path_id === pathId && r.learning_session_id != null)
+        .map((r) => ({ durationS: durationBySessionId.get(r.learning_session_id as number) ?? null }))
+        .filter((c): c is { durationS: number } => c.durationS != null && c.durationS > 0);
+      const meanLearningDurationS = avgBy(learningCandidates, 'durationS');
+      const stdDevLearningDurationS = stdDevBy(learningCandidates, 'durationS');
+      return {
+        pathId, totalAttempts: candidates.length, patientCount, expectedAttempts: patientUniverse.length,
+        completed: completedList, fastest, meanDurationS, stdDevDurationS, meanLearningDurationS, stdDevLearningDurationS,
+      };
     });
-  }, [validTrialRows, durationBySessionId, includedPatients]);
+  }, [filteredValidTrialRows, durationBySessionId, patientUniverse]);
 
   // Small-multiples "speed curve" data: rank 1..N on the x-axis, one line per
   // path — gaps (a path missing a point at some rank) are as informative as
@@ -518,7 +642,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
     const conditions = uniq(sessions.map((s) => s.condition));
     return conditions.map((condition) => {
       const label = sessions.find((s) => s.condition === condition)?.condition_label || condition;
-      const candidates = validTrialRows
+      const candidates = filteredValidTrialRows
         .filter((r) => r.condition === condition && r.exploration_session_id != null)
         .map((r) => ({
           patient: r.patient,
@@ -539,9 +663,35 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
       // reused across all 4 conditions, so this is the real experimental variable.
       const meanDurationS = avgBy(candidates, 'durationS');
       const stdDevDurationS = stdDevBy(candidates, 'durationS');
-      return { condition, label, totalAttempts: candidates.length, patientCount, expectedAttempts: includedPatients.length * 2, completed: completedList, fastest, meanDurationS, stdDevDurationS };
+      // Same trials' LEARNING recordings, as a reference point: was the
+      // exploration attempt faster/slower than the route just taught?
+      const learningCandidates = filteredValidTrialRows
+        .filter((r) => r.condition === condition && r.learning_session_id != null)
+        .map((r) => ({ durationS: durationBySessionId.get(r.learning_session_id as number) ?? null }))
+        .filter((c): c is { durationS: number } => c.durationS != null && c.durationS > 0);
+      const meanLearningDurationS = avgBy(learningCandidates, 'durationS');
+      const stdDevLearningDurationS = stdDevBy(learningCandidates, 'durationS');
+      return {
+        condition, label, totalAttempts: candidates.length, patientCount, expectedAttempts: patientUniverse.length * 2,
+        completed: completedList, fastest, meanDurationS, stdDevDurationS, meanLearningDurationS, stdDevLearningDurationS,
+      };
     });
-  }, [validTrialRows, durationBySessionId, sessions, includedPatients]);
+  }, [filteredValidTrialRows, durationBySessionId, sessions, patientUniverse]);
+
+  // Shortest/longest mean duration among conditions — reuses conditionCompletion's
+  // meanDurationS rather than recomputing it, for the compact duration-by-condition table.
+  const durationExtremes = useMemo((): { shortest: string | null; longest: string | null; shortestS: number | null; longestS: number | null } => {
+    const withValue = conditionCompletion.filter((c): c is typeof c & { meanDurationS: number } => c.meanDurationS != null);
+    if (!withValue.length) return { shortest: null, longest: null, shortestS: null, longestS: null };
+    const shortest = withValue.reduce((best, c) => (c.meanDurationS < best.meanDurationS ? c : best));
+    const longest = withValue.reduce((best, c) => (c.meanDurationS > best.meanDurationS ? c : best));
+    return { shortest: shortest.condition, longest: longest.condition, shortestS: shortest.meanDurationS, longestS: longest.meanDurationS };
+  }, [conditionCompletion]);
+
+  const durationChartData = useMemo(
+    () => conditionCompletion.map((c) => ({ name: c.label, meanDurationS: c.meanDurationS ?? 0 })),
+    [conditionCompletion],
+  );
 
   const completionCurveDataByCondition = useMemo(() => {
     const maxRank = Math.max(0, ...conditionCompletion.map((c) => c.completed.length));
@@ -558,6 +708,25 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
   // computed once here since several sections below (and the sections above)
   // share the same validTrialRows pool.
   const behavioralPatientCount = useMemo(() => new Set(validTrialRows.map((r) => r.patient)).size, [validTrialRows]);
+  const filteredBehavioralPatientCount = useMemo(
+    () => new Set(filteredValidTrialRows.map((r) => r.patient)).size,
+    [filteredValidTrialRows],
+  );
+
+  // Shared by every "Complete cases only" toggle on this page (Success by
+  // condition, Proximity escalation, Object impacts by target, Fastest
+  // completion per path/condition) — same checkbox, same underlying state,
+  // repeated wherever it's useful to see/flip without scrolling back up.
+  const completeCasesToggle = (
+    <label className="inlineCheck" title="Restricts this card to only patients who have at least one valid trial in ALL 4 conditions — so a condition with more exclusions (e.g. haptic_on_object_intes) is compared against the exact same group of people, not a larger/different one.">
+      <input
+        type="checkbox"
+        checked={completeCasesOnly}
+        onChange={(e) => setCompleteCasesOnly(e.target.checked)}
+      />
+      Complete cases only ({completeCasePatients.size} / {includedPatients.length} patients have valid data in all {allConditions.length} conditions)
+    </label>
+  );
 
   return (
     <>
@@ -756,14 +925,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
                 </ul>
               </InfoPopover>
             </h3>
-            <label className="inlineCheck" title="Restricts every row below to only patients who have at least one valid trial in ALL 4 conditions — so a condition with more exclusions (e.g. haptic_on_object_intes) is compared against the exact same group of people, not a larger/different one.">
-              <input
-                type="checkbox"
-                checked={completeCasesOnly}
-                onChange={(e) => setCompleteCasesOnly(e.target.checked)}
-              />
-              Complete cases only ({completeCasePatients.size} / {includedPatients.length} patients have valid data in all {allConditions.length} conditions)
-            </label>
+            {completeCasesToggle}
             <p className="miniHint">
               {completeCasesOnly ? completeCasePatients.size : behavioralPatientCount} patients · {conditionBreakdown.reduce((a, c) => a + c.total, 0)} trials analyzed.
             </p>
@@ -817,7 +979,206 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
                     formatter={(v: unknown) => typeof v === 'number' ? `${v}%` : '—'}
                   />
                   <Bar dataKey="successRate" name="Found all targets" isAnimationActive={false} radius={[6, 6, 0, 0]}>
-                    {conditionChartData.map((d) => <Cell key={d.name} fill={accent} />)}
+                    {conditionChartData.map((d) => <Cell key={d.name} fill={completeCasesOnly ? accentCompleteCasesOnly : accent} />)}
+                  </Bar>
+                </BarChart>
+              )}</ChartFrame>
+            </div>
+          </div>
+
+          <div className="behavioralSubcard span2">
+            <h3>
+              Route shape by condition
+              <InfoPopover>
+                <h4>Route shape by condition — column definitions</h4>
+                <p>Mean of each valid trial's route-shape metrics (same figures as the Trial metrics mini-card's Shape overlap section), averaged per condition:</p>
+                <ul>
+                  <li><strong>Shape dev (m)</strong> — mean pointwise distance between the learning and exploration routes (100-point arc-length resampled); lower is better.</li>
+                  <li><strong>Fréchet (m)</strong> — discrete Fréchet distance between the two routes; lower is better, dominated by the single worst-matching point rather than an average.</li>
+                  <li><strong>Overlap %</strong> — % of the exploration route within 0.5 m of some point on the learning route; higher is better.</li>
+                  <li><strong>n</strong> — valid trials averaged (same denominator as Success by condition above).</li>
+                </ul>
+                <Tex tex={String.raw`\text{Shape dev (m)} = \dfrac{1}{100}\sum_{k=1}^{100} d_k`} />
+                <p>Average, over the 100 arc-length-resampled points on each route, of the distance between the exploration route's point k and the learning route's point k at the SAME relative position — order-sensitive.</p>
+                <Tex tex={String.raw`\text{Overlap} \% = 100 \times \dfrac{\left|\{\,i : d_i \le 0.5\text{m}\,\}\right|}{N}`} />
+                <p>% of the N raw exploration-route samples within 0.5 m of the NEAREST point anywhere on the learning route — order-independent, so it can score high even on a differently-shaped or backtracking path.</p>
+              </InfoPopover>
+            </h3>
+            {completeCasesToggle}
+            <p className="miniHint">
+              {completeCasesOnly ? completeCasePatients.size : behavioralPatientCount} patients · {sumBy(conditionQualityBreakdown, 'n')} trials analyzed.
+            </p>
+            <div className="columnToggleRow">
+              <span className="miniHintInline">Columns:</span>
+              <label className="inlineCheck" title="Mean pointwise distance between the learning and exploration routes, order-sensitive (same relative position on each route) — lower is better.">
+                <input type="checkbox" checked={qualityColumnsVisible.shapeDev} onChange={() => toggleQualityColumn('shapeDev')} />
+                Shape dev (m)
+              </label>
+              <label className="inlineCheck">
+                <input type="checkbox" checked={qualityColumnsVisible.frechet} onChange={() => toggleQualityColumn('frechet')} />
+                Fréchet (m)
+              </label>
+              <label className="inlineCheck" title="% of exploration points within 0.5 m of ANY point on the learning route, order-independent — higher is better.">
+                <input type="checkbox" checked={qualityColumnsVisible.overlap} onChange={() => toggleQualityColumn('overlap')} />
+                Overlap %
+              </label>
+              <label className="inlineCheck">
+                <input type="checkbox" checked={qualityColumnsVisible.n} onChange={() => toggleQualityColumn('n')} />
+                n
+              </label>
+            </div>
+            <div className="copyPngRow">
+              <CopyAsPngButton targetRef={qualityTableRef} label="Copy table" />
+            </div>
+            <div className="tableWrap" ref={qualityTableRef}>
+              <table className="miniTable">
+                <thead>
+                  <tr>
+                    <th>Condition</th>
+                    {qualityColumnsVisible.shapeDev ? <th title="Mean pointwise distance between the learning and exploration routes, order-sensitive — lower is better.">Shape dev (m)</th> : null}
+                    {qualityColumnsVisible.frechet ? <th>Fréchet (m)</th> : null}
+                    {qualityColumnsVisible.overlap ? <th title="% of exploration points within 0.5 m of ANY point on the learning route, order-independent — higher is better.">Overlap %</th> : null}
+                    {qualityColumnsVisible.n ? <th>n</th> : null}
+                  </tr>
+                </thead>
+                <tbody>
+                  {conditionQualityBreakdown.map((c) => (
+                    <tr key={c.condition}>
+                      <td>{c.label}</td>
+                      {qualityColumnsVisible.shapeDev ? (
+                        <td>
+                          {fmtNum(c.shapeDeviationM, 2, ' m')}
+                          {c.condition === qualityExtremes.shapeDeviationBest ? ' (best)' : ''}
+                          {c.condition === qualityExtremes.shapeDeviationWorst ? ' (worst)' : ''}
+                        </td>
+                      ) : null}
+                      {qualityColumnsVisible.frechet ? (
+                        <td>
+                          {fmtNum(c.frechetDistanceM, 2, ' m')}
+                          {c.condition === qualityExtremes.frechetWorst ? ' (worst)' : ''}
+                        </td>
+                      ) : null}
+                      {qualityColumnsVisible.overlap ? (
+                        <td>
+                          {fmtNum(c.overlapPct, 2, '%')}
+                          {c.condition === qualityExtremes.overlapWorst ? ' (worst)' : ''}
+                        </td>
+                      ) : null}
+                      {qualityColumnsVisible.n ? <td>{c.n}</td> : null}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="statsStack">
+              <div>
+                <div className="copyPngRow">
+                  <CopyAsPngButton targetRef={shapeDeviationChartRef} label="Copy chart" />
+                </div>
+                <div ref={shapeDeviationChartRef}>
+                  <ChartFrame height={200} minWidth={260}>{(width, height) => (
+                    <BarChart width={width} height={height} data={qualityChartData} margin={{ top: 12, right: 8, bottom: 48, left: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="name" angle={-25} textAnchor="end" interval={0} height={60} tick={{ fontSize: 9 }} />
+                      <YAxis unit=" m" tick={{ fontSize: 10 }} />
+                      <Tooltip animationDuration={0} isAnimationActive={false} formatter={(v: unknown) => typeof v === 'number' ? `${v.toFixed(2)} m` : '—'} />
+                      <Bar dataKey="shapeDeviationM" name="Shape dev" isAnimationActive={false} radius={[6, 6, 0, 0]}>
+                        {qualityChartData.map((d) => <Cell key={d.name} fill={completeCasesOnly ? accentCompleteCasesOnly : accent} />)}
+                      </Bar>
+                    </BarChart>
+                  )}</ChartFrame>
+                </div>
+              </div>
+              <div>
+                <div className="copyPngRow">
+                  <CopyAsPngButton targetRef={frechetChartRef} label="Copy chart" />
+                </div>
+                <div ref={frechetChartRef}>
+                  <ChartFrame height={200} minWidth={260}>{(width, height) => (
+                    <BarChart width={width} height={height} data={qualityChartData} margin={{ top: 12, right: 8, bottom: 48, left: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="name" angle={-25} textAnchor="end" interval={0} height={60} tick={{ fontSize: 9 }} />
+                      <YAxis unit=" m" tick={{ fontSize: 10 }} />
+                      <Tooltip animationDuration={0} isAnimationActive={false} formatter={(v: unknown) => typeof v === 'number' ? `${v.toFixed(2)} m` : '—'} />
+                      <Bar dataKey="frechetDistanceM" name="Fréchet" isAnimationActive={false} radius={[6, 6, 0, 0]}>
+                        {qualityChartData.map((d) => <Cell key={d.name} fill={completeCasesOnly ? accentCompleteCasesOnly : accent} />)}
+                      </Bar>
+                    </BarChart>
+                  )}</ChartFrame>
+                </div>
+              </div>
+              <div>
+                <div className="copyPngRow">
+                  <CopyAsPngButton targetRef={overlapChartRef} label="Copy chart" />
+                </div>
+                <div ref={overlapChartRef}>
+                  <ChartFrame height={200} minWidth={260}>{(width, height) => (
+                    <BarChart width={width} height={height} data={qualityChartData} margin={{ top: 12, right: 8, bottom: 48, left: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="name" angle={-25} textAnchor="end" interval={0} height={60} tick={{ fontSize: 9 }} />
+                      <YAxis unit="%" domain={[0, 100]} tick={{ fontSize: 10 }} />
+                      <Tooltip animationDuration={0} isAnimationActive={false} formatter={(v: unknown) => typeof v === 'number' ? `${v.toFixed(0)}%` : '—'} />
+                      <Bar dataKey="overlapPct" name="Overlap" isAnimationActive={false} radius={[6, 6, 0, 0]}>
+                        {qualityChartData.map((d) => <Cell key={d.name} fill={completeCasesOnly ? accentCompleteCasesOnly : accent} />)}
+                      </Bar>
+                    </BarChart>
+                  )}</ChartFrame>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="behavioralSubcard span2">
+            <h3>
+              Duration by condition
+              <InfoPopover>
+                <p>Mean exploration duration per condition, over the same deduplicated valid trials (one attempt per patient × condition × path) as the tables above. "Mean duration (learning)" is the same trials' own learning recordings, as a reference point for how long the route took to teach in the first place.</p>
+                <p>A compact companion to "Fastest completion per condition" further below, which breaks the same numbers down further (fastest attempt, completed count, per-attempt order).</p>
+              </InfoPopover>
+            </h3>
+            {completeCasesToggle}
+            <p className="miniHint">
+              {sumBy(conditionCompletion, 'totalAttempts')} trials analyzed.
+            </p>
+            <div className="copyPngRow">
+              <CopyAsPngButton targetRef={durationTableRef} label="Copy table" />
+            </div>
+            <div className="tableWrap" ref={durationTableRef}>
+              <table className="miniTable">
+                <thead><tr><th>Condition</th><th>Mean duration (exploration)</th><th>Mean duration (learning)</th></tr></thead>
+                <tbody>
+                  {conditionCompletion.map((c) => (
+                    <tr key={c.condition}>
+                      <td>{c.label}</td>
+                      <td>
+                        {fmtNum(c.meanDurationS, 0, 's')}
+                        {c.condition === durationExtremes.shortest ? ' (shortest)' : ''}
+                        {c.condition === durationExtremes.longest && durationExtremes.shortestS
+                          ? ` (longest, +${Math.round(100 * (durationExtremes.longestS! / durationExtremes.shortestS - 1))}% vs shortest)`
+                          : ''}
+                      </td>
+                      <td className="miniHintInline">{fmtNum(c.meanLearningDurationS, 0, 's')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="copyPngRow">
+              <CopyAsPngButton targetRef={durationChartRef} label="Copy chart" />
+            </div>
+            <div ref={durationChartRef}>
+              <ChartFrame height={220} minWidth={260}>{(width, height) => (
+                <BarChart width={width} height={height} data={durationChartData} margin={{ top: 12, right: 12, bottom: 48, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="name" angle={-25} textAnchor="end" interval={0} height={60} tick={{ fontSize: 10 }} />
+                  <YAxis unit="s" tick={{ fontSize: 10 }} />
+                  <Tooltip
+                    animationDuration={0}
+                    isAnimationActive={false}
+                    formatter={(v: unknown) => typeof v === 'number' ? `${v.toFixed(0)} s` : '—'}
+                  />
+                  <Bar dataKey="meanDurationS" name="Mean duration" isAnimationActive={false} radius={[6, 6, 0, 0]}>
+                    {durationChartData.map((d) => <Cell key={d.name} fill={completeCasesOnly ? accentCompleteCasesOnly : accent} />)}
                   </Bar>
                 </BarChart>
               )}</ChartFrame>
@@ -826,7 +1187,8 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
 
           <div className="behavioralSubcard span2">
             <h3>Proximity escalation confirmed</h3>
-            <p className="miniHint">{behavioralPatientCount} patients · {validTrialRows.length} trials analyzed. Trials (by target × condition) where that target reached the closest proximity zone observed (bucket {proximityBreakdown.closestZone ?? '—'}).</p>
+            {completeCasesToggle}
+            <p className="miniHint">{filteredBehavioralPatientCount} patients · {filteredValidTrialRows.length} trials analyzed. Trials (by target × condition) where that target reached the closest proximity zone observed (bucket {proximityBreakdown.closestZone ?? '—'}).</p>
             <div className="tableWrap">
               <table className="miniTable">
                 <thead>
@@ -851,7 +1213,8 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
 
           <div className="behavioralSubcard">
             <h3>Object impacts by target</h3>
-            <p className="miniHint">{behavioralPatientCount} patients · {validTrialRows.length} trials analyzed. Counts are impact events, not trials — one trial can register more than one.</p>
+            {completeCasesToggle}
+            <p className="miniHint">{filteredBehavioralPatientCount} patients · {filteredValidTrialRows.length} trials analyzed. Counts are impact events, not trials — one trial can register more than one.</p>
             <div className="tableWrap">
               <table className="miniTable">
                 <thead><tr><th>Target</th><th>Impact count</th></tr></thead>
@@ -866,14 +1229,15 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
 
           <div className="behavioralSubcard span2">
             <h3>Fastest completion per path</h3>
+            {completeCasesToggle}
             <p className="miniHint">
-              {behavioralPatientCount} patients · {validTrialRows.length} trials considered — one attempt per (patient, condition, path): the latest, or the one manually chosen from the mini-card dropdown, never a raw count inflated by retries.
+              {filteredBehavioralPatientCount} patients · {filteredValidTrialRows.length} trials considered — one attempt per (patient, condition, path): the latest, or the one manually chosen from the mini-card dropdown, never a raw count inflated by retries.
               "Completed" = returned to the exploration's own start point within the threshold above. Order below is fastest → slowest among the completed trials only.
               "Trials" in parentheses is a rough expected count (~1 per included patient per path, from the 4 conditions × 2 paths protocol) — not a hard rule, just a quick check for whether a path's total looks low (missing patients).
             </p>
             <div className="tableWrap">
               <table className="miniTable">
-                <thead><tr><th>Path</th><th>Fastest</th><th>Mean ± SD</th><th>Completed</th><th>Order (fastest → slowest)</th></tr></thead>
+                <thead><tr><th>Path</th><th>Fastest</th><th>Mean ± SD (exploration)</th><th>Mean ± SD (learning)</th><th>Completed</th><th>Order (fastest → slowest)</th></tr></thead>
                 <tbody>
                   {pathCompletion.map((p) => (
                     <tr key={p.pathId}>
@@ -883,6 +1247,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
                         {p.fastest && !p.fastest.completedOnly ? ' (no completed attempt)' : ''}
                       </td>
                       <td>{fmtNum(p.meanDurationS, 0, ' s')}{p.stdDevDurationS != null ? ` ± ${fmtNum(p.stdDevDurationS, 0, ' s')}` : ''}</td>
+                      <td className="miniHintInline">{fmtNum(p.meanLearningDurationS, 0, ' s')}{p.stdDevLearningDurationS != null ? ` ± ${fmtNum(p.stdDevLearningDurationS, 0, ' s')}` : ''}</td>
                       <td>{p.completed.length}/{p.totalAttempts} <span className="miniHintInline">({p.patientCount} pts, ~{p.expectedAttempts} expected)</span></td>
                       <td className="completionOrderCell">
                         {p.completed.length
@@ -927,14 +1292,15 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
                 <p>Grouping by condition instead compares the actual experimental variable: feedback modality (auditory/haptic) × delivery location (on object/on person).</p>
               </InfoPopover>
             </h3>
+            {completeCasesToggle}
             <p className="miniHint">
-              {behavioralPatientCount} patients · {validTrialRows.length} trials considered — one attempt per (patient, condition, path), across both paths of each condition.
+              {filteredBehavioralPatientCount} patients · {filteredValidTrialRows.length} trials considered — one attempt per (patient, condition, path), across both paths of each condition.
               Same "completed" definition as above; order is fastest → slowest among completed trials only.
               "Trials" in parentheses is a rough expected count (~2 per included patient per condition, from the "2 paths per condition" protocol) — not a hard rule, just a quick check for missing patients.
             </p>
             <div className="tableWrap">
               <table className="miniTable">
-                <thead><tr><th>Condition</th><th>Fastest</th><th>Mean ± SD</th><th>Completed</th><th>Order (fastest → slowest)</th></tr></thead>
+                <thead><tr><th>Condition</th><th>Fastest</th><th>Mean ± SD (exploration)</th><th>Mean ± SD (learning)</th><th>Completed</th><th>Order (fastest → slowest)</th></tr></thead>
                 <tbody>
                   {conditionCompletion.map((c) => (
                     <tr key={c.condition}>
@@ -944,6 +1310,7 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
                         {c.fastest && !c.fastest.completedOnly ? ' (no completed attempt)' : ''}
                       </td>
                       <td>{fmtNum(c.meanDurationS, 0, ' s')}{c.stdDevDurationS != null ? ` ± ${fmtNum(c.stdDevDurationS, 0, ' s')}` : ''}</td>
+                      <td className="miniHintInline">{fmtNum(c.meanLearningDurationS, 0, ' s')}{c.stdDevLearningDurationS != null ? ` ± ${fmtNum(c.stdDevLearningDurationS, 0, ' s')}` : ''}</td>
                       <td>{c.completed.length}/{c.totalAttempts} <span className="miniHintInline">({c.patientCount} pts, ~{c.expectedAttempts} expected)</span></td>
                       <td className="completionOrderCell">
                         {c.completed.length
@@ -979,6 +1346,111 @@ export function GeneralStatisticsPanel({ sessions, sessionRows, trialRows, patie
             )}</ChartFrame>
           </div>
         </div>
+      </section>
+
+      <section className="card">
+        <div className="cardHeader">
+          <div>
+            <h2>
+              ANOVA — Modality × Location
+              <InfoPopover>
+                <h4>Design</h4>
+                <p>The 4 recorded conditions are a full 2×2 within-subject factorial: feedback <strong>Modality</strong> (auditory/haptic) × delivery <strong>Location</strong> (on object/on person). Every patient experiences all 4 — each tied to its own fixed pair of paths, which is why Path isn't a usable 3rd factor here: it's nested inside Condition, not crossed with it.</p>
+                <h4>Why these dependent variables first</h4>
+                <p>Path efficiency, homing (endpoint) error, target acquisition % and the performance score are continuous-ish, already reported per trial elsewhere in this app, and — importantly — each is defined only for an exploration attempt relative to its own learning baseline. That's also why Phase (learning/exploration) isn't a 3rd factor: there's no independent "learning" value of the same measure to contrast it against.</p>
+                <p>Left out for now: boundary_contacts and raw targets-found counts — low-count data that's a poor fit for ANOVA's normality assumption; a Poisson/ordinal model would suit them better.</p>
+                <h4>Complete cases (mandatory here)</h4>
+                <p>A patient only enters a given DV's test if they have a usable value in all 4 conditions for it — statsmodels' AnovaRM requires a fully balanced design, unlike the optional "Complete cases only" toggle elsewhere on this page. The two paths within one condition are averaged into a single cell per patient.</p>
+              </InfoPopover>
+            </h2>
+            <p>Two-way repeated-measures ANOVA (statsmodels AnovaRM), subject = patient, factors = feedback Modality × delivery Location.</p>
+          </div>
+        </div>
+
+        {anovaError && <p className="miniHint" style={{ padding: '0 20px' }}>Could not load ANOVA results: {anovaError}</p>}
+        {!anovaResults && !anovaError && <p className="miniHint" style={{ padding: '0 20px' }}>Loading…</p>}
+
+        {anovaResults && (
+          <div className="behavioralSubgrid">
+            {anovaResults.dvs.map((dv) => {
+              const barData = dv.conditions.map((c) => ({
+                condition: c,
+                label: shortConditionLabel(c),
+                mean: dv.cell_means?.[c]?.mean ?? null,
+              }));
+              return (
+                <div className="behavioralSubcard" key={dv.dv}>
+                  <h3>{dv.label}</h3>
+                  {dv.insufficient_data ? (
+                    <p className="miniHint">
+                      Not enough complete-case data for a balanced 2×2 test — {dv.n_patients} patient(s) with a usable value in all 4 conditions (need at least 4).
+                      {dv.error ? ` (${dv.error})` : ''}
+                    </p>
+                  ) : (
+                    <>
+                      <p className="miniHint">{dv.n_patients} patients with complete data in all 4 conditions.</p>
+                      <div className="tableWrap">
+                        <table className="miniTable">
+                          <thead><tr><th>Condition</th><th>Mean ± SD</th><th>n</th></tr></thead>
+                          <tbody>
+                            {dv.conditions.map((c) => {
+                              const cm = dv.cell_means?.[c];
+                              return (
+                                <tr key={c}>
+                                  <td><span className="pathDot" style={{ background: CONDITION_COLORS[c] ?? '#888' }} />{shortConditionLabel(c)}</td>
+                                  <td>{cm ? `${fmtNum(cm.mean, 2)}${cm.sd != null ? ` ± ${fmtNum(cm.sd, 2)}` : ''}` : '—'}</td>
+                                  <td>{cm?.n ?? '—'}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      <ChartFrame height={200} minWidth={280}>{(width, height) => (
+                        <BarChart width={width} height={height} data={barData} margin={{ top: 12, right: 12, bottom: 32, left: 0 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="label" tick={{ fontSize: 10 }} />
+                          <YAxis tick={{ fontSize: 10 }} />
+                          <Tooltip animationDuration={0} isAnimationActive={false} formatter={(v: unknown) => (typeof v === 'number' ? fmtNum(v, 2) : '—')} />
+                          <Bar dataKey="mean" isAnimationActive={false} radius={[6, 6, 0, 0]}>
+                            {barData.map((b) => <Cell key={b.condition} fill={CONDITION_COLORS[b.condition] ?? '#888'} />)}
+                          </Bar>
+                        </BarChart>
+                      )}</ChartFrame>
+                      <p className="miniHint">{DV_CHART_DESCRIPTIONS[dv.dv]}</p>
+                      <div className="tableWrap">
+                        <table className="miniTable">
+                          <thead><tr><th>Effect</th><th>F</th><th>df</th><th>p</th></tr></thead>
+                          <tbody>
+                            {([
+                              ['modality', 'Modality (auditory/haptic)'],
+                              ['location', 'Location (on object/on person)'],
+                              ['interaction', 'Modality × Location'],
+                            ] as const).map(([key, effLabel]) => {
+                              const eff = dv.effects?.[key];
+                              const significant = eff != null && eff.p < 0.05;
+                              return (
+                                <tr key={key}>
+                                  <td>{effLabel}</td>
+                                  <td>{eff ? fmtNum(eff.F, 2) : '—'}</td>
+                                  <td>{eff ? `${eff.df_num}, ${eff.df_den}` : '—'}</td>
+                                  <td className={significant ? 'anovaSignificant' : undefined}>{eff ? fmtNum(eff.p, 3) : '—'}{significant ? ' *' : ''}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      <p className="miniHint">
+                        * p &lt; .05. n = {dv.n_patients} patients — pilot-scale evidence, treat as exploratory rather than confirmatory; consider a non-parametric alternative (Friedman) or a mixed model if normality/sphericity is in doubt.
+                      </p>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
     </>
   );
