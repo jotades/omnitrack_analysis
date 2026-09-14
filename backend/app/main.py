@@ -9,8 +9,10 @@ from pydantic import BaseModel
 
 from .analysis import (
     clear_caches,
+    clear_derived_caches,
     compare_sessions,
     compare_trials,
+    compute_anova_results,
     compute_speed_accel_correlations,
     df_records,
     get_sessions_df,
@@ -188,6 +190,17 @@ def performance_correlations():
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.get("/api/anova")
+def anova():
+    """Two-way repeated-measures ANOVA (Modality x Location, subject=patient)
+    per dependent variable — see compute_anova_results' docstring for the
+    design, the complete-cases requirement, and why phase isn't a 3rd factor."""
+    try:
+        return compute_anova_results()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/trials/summary")
 def trials_summary(patients: Optional[List[str]] = Query(None)):
     try:
@@ -209,7 +222,7 @@ class AnnotationIn(BaseModel):
 @app.post("/api/annotations")
 def upsert_annotation(payload: AnnotationIn):
     try:
-        return save_annotation(
+        result = save_annotation(
             payload.patient,
             payload.condition,
             payload.path_id,
@@ -218,6 +231,8 @@ def upsert_annotation(payload: AnnotationIn):
             payload.comment,
             payload.excluded_from_stats,
         )
+        clear_derived_caches()  # excluded_from_stats changes who counts in ANOVA/correlations
+        return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -238,7 +253,9 @@ class PatientInclusionIn(BaseModel):
 @app.post("/api/patient-inclusion")
 def upsert_patient_inclusion(payload: PatientInclusionIn):
     try:
-        return {"inclusion": save_inclusion(payload.patient, payload.included)}
+        result = {"inclusion": save_inclusion(payload.patient, payload.included)}
+        clear_derived_caches()  # opting a patient in/out changes ANOVA's complete-case pool
+        return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -264,6 +281,7 @@ class TargetCoordinateIn(BaseModel):
 def upsert_target_coordinate(payload: TargetCoordinateIn):
     try:
         record = save_target_coordinate(payload.patient, payload.condition, payload.path_id, payload.target_id, payload.x, payload.y)
+        clear_derived_caches()  # a moved target changes proximity/found/path-efficiency downstream
         return {"coordinates": record}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -290,6 +308,7 @@ class ManualTargetFoundIn(BaseModel):
 def upsert_manual_target_found(payload: ManualTargetFoundIn):
     try:
         record = save_manual_target_found(payload.patient, payload.condition, payload.path_id, payload.target_id, payload.found)
+        clear_derived_caches()
         return {"override": record}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -307,6 +326,7 @@ class ManualInOrderIn(BaseModel):
 def upsert_manual_in_order(payload: ManualInOrderIn):
     try:
         record = save_manual_in_order(payload.patient, payload.condition, payload.path_id, payload.in_order)
+        clear_derived_caches()
         return {"override": record}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

@@ -3,14 +3,17 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from statsmodels.stats.anova import AnovaRM
 
 from .annotations import annotation_key, get_annotation, load_annotations
+from .inclusion import load_inclusion
 from .manual_discovery import get_manual_discovery_override
 from .phase_overrides import load_phase_overrides
 from .target_coordinates import get_target_coordinates
@@ -59,6 +62,24 @@ def load_json_cached(path_str: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def clear_derived_caches() -> None:
+    """Invalidate only the dataset-wide DERIVED aggregates (ANOVA, speed/
+    accel correlations) — NOT the expensive per-trial trajectory-comparison
+    caches below (load_trial_metrics etc.), which stay valid since they
+    depend only on the raw recorded x/y/z trajectories, never on
+    annotations/manual coordinates/discovery overrides/patient inclusion.
+
+    Call this (instead of clear_caches) after any save that can change which
+    trials count or how they're valued — annotation, target coordinate,
+    manual discovery override, patient inclusion — so General
+    statistics/ANOVA reflect it on the very next request. Cheap: the
+    expensive geometry work underneath is already cached and doesn't need
+    to be redone, unlike a full /api/refresh.
+    """
+    compute_speed_accel_correlations.cache_clear()
+    compute_anova_results.cache_clear()
+
+
 def clear_caches() -> None:
     load_json_cached.cache_clear()
     build_sessions_index_cached.cache_clear()
@@ -66,7 +87,7 @@ def clear_caches() -> None:
     load_trial_metrics.cache_clear()
     load_exploration_movement_events.cache_clear()
     load_target_sensor_proximity.cache_clear()
-    compute_speed_accel_correlations.cache_clear()
+    clear_derived_caches()
 
 
 def discover_json_files(base_dir: Path) -> List[Tuple[Path, Optional[str]]]:
@@ -1991,6 +2012,166 @@ def compute_speed_accel_correlations() -> Dict[str, Any]:
             "accel_vs_border_crossings": _corr(accels, borders),
         },
     }
+
+
+# The four recorded conditions are a full 2x2 factorial — feedback Modality
+# (auditory/haptic) x delivery Location (on_object/on_person) — each patient
+# experiences all 4 (within-subject), each tied to 2 of the 8 paths. Path
+# itself is NOT a usable ANOVA factor: it's nested inside condition (every
+# condition owns its own fixed pair of paths), not crossed with it.
+def _condition_factors(condition: str) -> Tuple[str, str]:
+    c = str(condition)
+    modality = "haptic" if c.startswith("haptic") else "auditory"
+    location = "on_object" if "on_object" in c else "on_person"
+    return modality, location
+
+
+# Starting set of dependent variables for the 2-way repeated-measures ANOVA
+# below, picked for being continuous-ish, already reported per-trial
+# elsewhere in the app, and NOT requiring a learning-phase counterpart (see
+# compute_anova_results' docstring for why phase isn't a 3rd factor here).
+# boundary_contacts/targets_found-as-count are deliberately left out for now
+# — they're low-count data that likely violates the normality assumption
+# ANOVA relies on; a Poisson/ordinal model would suit them better.
+ANOVA_DV_SPECS: List[Tuple[str, str, Optional[str]]] = [
+    ("path_efficiency_pct", "Path efficiency (%)", "nav_metrics"),
+    ("endpoint_error_m", "Endpoint (homing) error (m)", "nav_metrics"),
+    ("target_acquisition_pct", "Target acquisition (%)", "nav_metrics"),
+    ("performance_score", "Performance score (1-5)", None),
+]
+
+
+@lru_cache(maxsize=1)
+def compute_anova_results() -> Dict[str, Any]:
+    """Two-way repeated-measures ANOVA (statsmodels' AnovaRM) per dependent
+    variable in ANOVA_DV_SPECS, factors Modality (auditory/haptic) x Location
+    (on_object/on_person) x Patient (subject, within-subject on both factors)
+    — the dataset's actual experimental design (see _condition_factors).
+
+    Phase (learning/exploration) is deliberately NOT a 3rd factor: every DV
+    here (path efficiency, homing error, target acquisition, performance
+    score) is defined only for an exploration attempt relative to its own
+    learning baseline — there's no independent "learning" value of the same
+    measure to contrast it against, so phase can't be crossed with the other
+    two factors the way a real repeated measure would need.
+
+    Per (patient, condition, path) cell: reuses compare_trials' output (same
+    metrics, same manual-override handling as every other panel) and keeps
+    the latest attempt that is NOT "excluded from statistics" — if the very
+    latest retry was excluded, this falls back to the most recent valid one
+    before it, rather than dropping the whole cell. Same convention as the
+    frontend's validTrialRows (used by "Route shape by condition" and
+    everywhere else on this page), so patient/n counts here stay consistent
+    with the rest of General statistics — NOT the same convention as
+    trials_summary_by_patient (which drops the cell outright when only its
+    own latest attempt is excluded). The two paths of one condition are then
+    averaged into a single (patient, condition) cell, since AnovaRM needs
+    exactly one value per subject per design cell.
+
+    "Complete cases only", per DV: a patient only enters a DV's ANOVA if
+    they have a usable value in ALL 4 conditions for that DV (e.g. a patient
+    missing haptic_on_object data entirely would otherwise unbalance the
+    design) — same reasoning as the "Complete cases only" toggle elsewhere
+    in General statistics, just mandatory here since AnovaRM requires a
+    fully balanced design (no missing cells) to run at all.
+
+    Opted-out patients (patient_inclusion) are excluded up front, same as
+    every other General-statistics number. Cached (cleared by /api/refresh).
+
+    A DV with fewer than 4 complete-case patients, or a dataset that doesn't
+    resolve to exactly the expected 4 conditions, is reported with
+    insufficient_data=True instead of a (meaningless/unstable) ANOVA table.
+    """
+    rows = compare_trials(include_suspicious=True)
+    if not rows:
+        return {"dvs": []}
+
+    inclusion = load_inclusion()
+    # Latest NON-excluded attempt per (patient, condition, path_id) — rows
+    # come out of compare_trials grouped by that same key and chronologically
+    # ordered within it (see build_trials_df), so the last assignment below
+    # is always the most recent attempt that qualifies. See the convention
+    # note in the docstring above.
+    latest_cell: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for r in rows:
+        if inclusion.get(r["patient"], True) is False:
+            continue
+        if r.get("excluded_from_stats") or r.get("exploration_session_id") is None:
+            continue
+        latest_cell[(r["patient"], r["condition"], r["path_id"])] = r
+
+    all_conditions = sorted({c for _, c, _ in latest_cell.keys()})
+
+    dv_results: List[Dict[str, Any]] = []
+    for dv_key, dv_label, source in ANOVA_DV_SPECS:
+        per_patient_condition: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+        for (patient, condition, _path_id), r in latest_cell.items():
+            if source == "nav_metrics":
+                nm = r.get("nav_metrics")
+                value = nm.get(dv_key) if nm else None
+            else:
+                value = r.get(dv_key)
+            if value is not None:
+                per_patient_condition[(patient, condition)].append(float(value))
+
+        cell_value: Dict[Tuple[str, str], float] = {
+            key: float(np.mean(values)) for key, values in per_patient_condition.items() if values
+        }
+        patients = sorted({p for p, _ in cell_value.keys()})
+        complete_patients = [p for p in patients if all((p, c) in cell_value for c in all_conditions)]
+
+        if len(all_conditions) != 4 or len(complete_patients) < 4:
+            dv_results.append({
+                "dv": dv_key, "label": dv_label, "n_patients": len(complete_patients),
+                "conditions": all_conditions, "insufficient_data": True,
+            })
+            continue
+
+        cell_means = {}
+        for condition in all_conditions:
+            values = [cell_value[(p, condition)] for p in complete_patients]
+            modality, location = _condition_factors(condition)
+            cell_means[condition] = {
+                "modality": modality, "location": location,
+                "mean": float(np.mean(values)),
+                "sd": float(np.std(values, ddof=1)) if len(values) > 1 else None,
+                "n": len(values),
+            }
+
+        long_df = pd.DataFrame([
+            {
+                "patient": p,
+                "modality": _condition_factors(condition)[0],
+                "location": _condition_factors(condition)[1],
+                "value": cell_value[(p, condition)],
+            }
+            for p in complete_patients for condition in all_conditions
+        ])
+
+        try:
+            table = AnovaRM(long_df, depvar="value", subject="patient", within=["modality", "location"]).fit().anova_table
+            effect_key = {"modality": "modality", "location": "location", "modality:location": "interaction"}
+            effects = {
+                effect_key.get(name, name): {
+                    "F": float(row["F Value"]),
+                    "df_num": float(row["Num DF"]),
+                    "df_den": float(row["Den DF"]),
+                    "p": float(row["Pr > F"]),
+                }
+                for name, row in table.iterrows()
+            }
+            dv_results.append({
+                "dv": dv_key, "label": dv_label, "n_patients": len(complete_patients),
+                "conditions": all_conditions, "cell_means": cell_means, "effects": effects,
+                "insufficient_data": False,
+            })
+        except Exception as exc:
+            dv_results.append({
+                "dv": dv_key, "label": dv_label, "n_patients": len(complete_patients),
+                "conditions": all_conditions, "insufficient_data": True, "error": str(exc),
+            })
+
+    return {"dvs": dv_results}
 
 
 def compare_trials(
