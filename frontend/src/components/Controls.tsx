@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import type { SessionRow } from '../types';
+import { routeLabel } from '../lib/route';
+import { conditionLabel, participantLabel, phaseLabel } from '../lib/glossary';
 
 interface Props {
   sessions: SessionRow[];
@@ -70,52 +72,52 @@ export function Controls(props: Props) {
           <div className="drawerHeader">
             <div>
               <strong>Dashboard settings</strong>
-              <p>{current ? `${current.patient} / ${current.phase} / ${current.path_id}` : 'Select a session'}</p>
+              <p>{current ? `${participantLabel(current.patient)} / ${phaseLabel(current.phase)} / route ${routeLabel(current.path_id, current.route_id)}` : 'Select a session'}</p>
             </div>
             <button type="button" className="closeButton" onClick={() => setOpen(false)}>×</button>
           </div>
 
           <div className="controlGrid">
             <label>
-              Patient
+              Participant
               <select value={props.selectedPatient} onChange={(e) => props.onPatient(e.target.value)}>
-                {patients.map((p) => <option key={p} value={p}>{p}</option>)}
+                {patients.map((p) => <option key={p} value={p}>{participantLabel(p)}</option>)}
               </select>
             </label>
 
             <label>
-              Task / condition
+              Condition
               <select value={props.selectedCondition} onChange={(e) => props.onCondition(e.target.value)}>
-                {conditions.map((c) => {
-                  const label = props.sessions.find((s) => s.condition === c)?.condition_label ?? c;
-                  return <option key={c} value={c}>{label}</option>;
-                })}
+                {conditions.map((c) => <option key={c} value={c}>{conditionLabel(c)}</option>)}
               </select>
             </label>
 
             <label>
               Phase
               <select value={props.selectedPhase} onChange={(e) => props.onPhase(e.target.value)}>
-                {phases.map((p) => <option key={p} value={p}>{p}</option>)}
+                {phases.map((p) => <option key={p} value={p}>{phaseLabel(p)}</option>)}
               </select>
             </label>
 
             <label>
-              Path
+              Route
               <select value={props.selectedPath} onChange={(e) => props.onPath(e.target.value)}>
-                {paths.map((p) => <option key={p} value={p}>{p}</option>)}
+                {paths.map((p) => {
+                  const route = props.sessions.find((s) => s.path_id === p && s.patient === props.selectedPatient && s.condition === props.selectedCondition)?.route_id;
+                  return <option key={p} value={p}>{routeLabel(p, route)}</option>;
+                })}
               </select>
             </label>
 
             <label className="wide">
-              Session
+              Recording
               <select
                 value={props.selectedSessionId ?? ''}
                 onChange={(e) => props.onSession(Number(e.target.value))}
               >
                 {sessionOptions.map((s) => (
                   <option key={s.session_id} value={s.session_id}>
-                    {s.phase} | {s.path_id} | {s.start_time ?? 'no time'} | {s.n_raw ?? '?'} samples | {s.warning}
+                    {phaseLabel(s.phase)} | route {routeLabel(s.path_id, s.route_id)} | {s.start_time ?? 'no time'} | {s.n_raw ?? '?'} samples | {s.warning}
                   </option>
                 ))}
               </select>

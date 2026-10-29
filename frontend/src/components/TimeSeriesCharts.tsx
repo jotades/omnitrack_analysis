@@ -16,6 +16,14 @@ import { ChartCard } from './ChartCard';
 import { ChartFrame } from './ChartFrame';
 import { ChartScaleControls, ScaleMode, yDomain } from './ChartScaleControls';
 
+const compactTick = (v: unknown) => {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return String(v ?? '');
+  const a = Math.abs(v);
+  if (a >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (a >= 1e4) return `${(v / 1e3).toFixed(0)}k`;
+  return Number.isInteger(v) ? String(v) : v.toFixed(a < 10 ? 2 : 1);
+};
+
 const colors = ['#3b5bfd', '#17b26a', '#f79009', '#7a5af8', '#06aed4', '#d92d20'];
 
 interface TimedChartProps {
@@ -109,7 +117,7 @@ function xDomain(duration: number): [number, number] {
   return [0, Math.max(0.01, duration)];
 }
 
-const chartMargin = { top: 12, right: 22, bottom: 24, left: 4 };
+const chartMargin = { top: 22, right: 22, bottom: 24, left: 4 };
 const tooltipProps = {
   animationDuration: 0,
   isAnimationActive: false,
@@ -127,7 +135,7 @@ export function DistanceChart({ payload, playbackTime, duration, onCursorTime }:
   const legendItems = targets.map((target, idx) => ({ name: `P1-${target}`, color: colors[idx % colors.length] }));
 
   return (
-    <ChartCard title="P1–target distances" subtitle="Hover the chart to move the time cursor: the solid part fills up to the hovered point, in sync with every chart.">
+    <ChartCard title="P1–landmark distances" subtitle="Hover the chart to move the time cursor: the solid part fills up to the hovered point, in sync with every chart.">
       {!data.length ? <EmptyChart /> : (
         <>
           <ChartScaleControls value={scaleMode} onChange={setScaleMode} />
@@ -135,11 +143,11 @@ export function DistanceChart({ payload, playbackTime, duration, onCursorTime }:
             <LineChart width={width} height={height} data={chartData} margin={chartMargin} onMouseMove={chartMouseMove(onCursorTime)}>
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="t_s" unit="s" type="number" domain={xDomain(d)} allowDataOverflow />
-              <YAxis domain={yDomain(yValues, scaleMode)} />
+              <YAxis width={52} tickFormatter={compactTick} domain={yDomain(yValues, scaleMode)} />
               <Tooltip {...tooltipProps} formatter={fmt} cursor={{ stroke: '#98a2b3', strokeWidth: 1 }} />
-              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label="now" />
+              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label={{ value: "now", position: "top", fontSize: 10, fill: "#d92d20" }} />
               {thresholdLines.map(([label, value]) => (
-                <ReferenceLine key={label} y={value} label={label} strokeDasharray="4 4" />
+                <ReferenceLine key={label} y={value} label={{ value: label, position: "insideTopRight", fontSize: 10, fill: "#667085" }} strokeDasharray="4 4" />
               ))}
               {targets.map((target, idx) => (
                 <Line
@@ -194,7 +202,7 @@ export function ClosestAndFeedbackChart({ payload, playbackTime, duration, onCur
   const yValues = lineData.map((row) => row.closest_distance).concat(feedbackData.map((row) => row.feedback_distance as number), thresholdLines.map(([, value]) => value));
 
   return (
-    <ChartCard title="Closest target + feedback event distance" subtitle="Closest-target line; feedback_changed event markers up to the current time.">
+    <ChartCard title="Closest landmark + feedback event distance" subtitle="Closest-landmark line (horizontal distance, x and y only); feedback_changed event markers up to the current time.">
       {!lineData.length && !feedbackData.length ? <EmptyChart /> : (
         <>
           <ChartScaleControls value={scaleMode} onChange={setScaleMode} />
@@ -202,11 +210,11 @@ export function ClosestAndFeedbackChart({ payload, playbackTime, duration, onCur
             <ComposedChart width={width} height={height} data={chartData} margin={chartMargin} onMouseMove={chartMouseMove(onCursorTime)}>
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="t_s" unit="s" type="number" domain={xDomain(d)} allowDataOverflow />
-              <YAxis domain={yDomain(yValues, scaleMode)} />
+              <YAxis width={52} tickFormatter={compactTick} domain={yDomain(yValues, scaleMode)} />
               <Tooltip {...tooltipProps} formatter={fmt} cursor={{ stroke: '#98a2b3', strokeWidth: 1 }} />
-              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label="now" />
+              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label={{ value: "now", position: "top", fontSize: 10, fill: "#d92d20" }} />
               {thresholdLines.map(([label, value]) => (
-                <ReferenceLine key={label} y={value} label={label} strokeDasharray="4 4" />
+                <ReferenceLine key={label} y={value} label={{ value: label, position: "insideTopRight", fontSize: 10, fill: "#667085" }} strokeDasharray="4 4" />
               ))}
               {lineData.length ? (
                 <Line type="linear" dataKey="closest_distance" dot={false} activeDot={{ r: 4 }} name="closest distance" stroke={colors[0]} {...ghostStroke} isAnimationActive={false} />
@@ -245,9 +253,9 @@ export function FeedbackIntensityChart({ payload, playbackTime, duration, onCurs
             <LineChart width={width} height={height} data={chartData} margin={chartMargin} onMouseMove={chartMouseMove(onCursorTime)}>
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="t_s" unit="s" type="number" domain={xDomain(d)} allowDataOverflow />
-              <YAxis domain={yDomain(yValues, scaleMode)} />
+              <YAxis width={52} tickFormatter={compactTick} domain={yDomain(yValues, scaleMode)} />
               <Tooltip {...tooltipProps} formatter={fmt} cursor={{ stroke: '#98a2b3', strokeWidth: 1 }} />
-              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label="now" />
+              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label={{ value: "now", position: "top", fontSize: 10, fill: "#d92d20" }} />
               <Line type="stepAfter" dataKey="intensity" name="intensity" dot={false} activeDot={{ r: 4 }} stroke={colors[0]} {...ghostStroke} isAnimationActive={false} />
               <Line type="stepAfter" dataKey="intensity__past" dot={false} activeDot={false} tooltipType="none" stroke={colors[0]} strokeWidth={2} isAnimationActive={false} />
             </LineChart>
@@ -362,7 +370,7 @@ export function OrientationAnglesChart({ payload, playbackTime, duration, onCurs
               <YAxis domain={yDomain(yValues, scaleMode)} unit={mode === 'angles' ? '°' : undefined} />
               <Tooltip {...tooltipProps} formatter={fmt} cursor={{ stroke: '#98a2b3', strokeWidth: 1 }} />
               <ReferenceLine y={0} stroke="#98a2b3" strokeDasharray="4 4" />
-              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label="now" />
+              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label={{ value: "now", position: "top", fontSize: 10, fill: "#d92d20" }} />
               {keys.map((key) => (
                 <Line key={`${key}-ghost`} type="linear" dataKey={key} name={names[key]} dot={false} activeDot={{ r: 4 }}
                   stroke={angleColors[key]} {...ghostStroke} isAnimationActive={false} />
@@ -404,9 +412,9 @@ export function SpeedChart({ payload, playbackTime, duration, onCursorTime }: Ti
             <LineChart width={width} height={height} data={chartData} margin={chartMargin} onMouseMove={chartMouseMove(onCursorTime)}>
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="t_s" unit="s" type="number" domain={xDomain(d)} allowDataOverflow />
-              <YAxis domain={yDomain(yValues, scaleMode)} />
+              <YAxis width={52} tickFormatter={compactTick} domain={yDomain(yValues, scaleMode)} />
               <Tooltip {...tooltipProps} formatter={fmt} cursor={{ stroke: '#98a2b3', strokeWidth: 1 }} />
-              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label="now" />
+              <ReferenceLine x={t} stroke="#d92d20" strokeWidth={1.5} strokeDasharray="5 4" label={{ value: "now", position: "top", fontSize: 10, fill: "#d92d20" }} />
               <Line type="linear" dataKey="speed_m_s" name="raw speed" dot={false} activeDot={false} stroke={colors[0]} strokeOpacity={0.12} isAnimationActive={false} connectNulls />
               <Line type="linear" dataKey="speed_m_s_smooth" name="smooth median" dot={false} activeDot={{ r: 4 }} stroke={colors[1]} {...ghostStroke} isAnimationActive={false} connectNulls />
               <Line type="linear" dataKey="speed_m_s__past" dot={false} activeDot={false} tooltipType="none" stroke={colors[0]} strokeOpacity={0.35} isAnimationActive={false} connectNulls />

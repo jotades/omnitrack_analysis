@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import functools
+import gc
 import json
 import math
 import re
+import threading
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -16,10 +19,27 @@ from .annotations import annotation_key, get_annotation, load_annotations
 from .inclusion import load_inclusion
 from .manual_discovery import get_manual_discovery_override
 from .phase_overrides import load_phase_overrides
-from .target_coordinates import get_target_coordinates
+from .recording_pins import load_recording_pins, pin_key
+from .route_overrides import actual_route
+from .stats_exclusions import load_stats_exclusions
+from .target_coordinates import get_target_coordinates, protocol_landmark_coordinates
+from .task_split import load_task_splits
 from .settings import get_settings
 
 settings = get_settings()
+
+_compute_lock = threading.RLock()
+
+
+def _serialized(cached_fn):
+    """Put on top of @lru_cache: lru_cache doesn't lock, so the page's
+    parallel requests would each compute the same uncached value at once."""
+    @functools.wraps(cached_fn)
+    def wrapper(*args, **kwargs):
+        with _compute_lock:
+            return cached_fn(*args, **kwargs)
+    wrapper.cache_clear = cached_fn.cache_clear
+    return wrapper
 
 IGNORE_FILENAMES = {"_summary.json"}
 FILENAME_RE = re.compile(
@@ -78,10 +98,19 @@ def clear_derived_caches() -> None:
     """
     compute_speed_accel_correlations.cache_clear()
     compute_anova_results.cache_clear()
+    get_pause_noise_threshold.cache_clear()
 
 
 def clear_caches() -> None:
+    gc.unfreeze()
     load_json_cached.cache_clear()
+    _tracking_df_cached.cache_clear()
+    load_task_segments.cache_clear()
+    load_task_event_counts.cache_clear()
+    load_pause_metrics.cache_clear()
+    load_border_counts.cache_clear()
+    load_landmark_zone_split.cache_clear()
+    load_learning_approach_depth.cache_clear()
     build_sessions_index_cached.cache_clear()
     load_session_metrics.cache_clear()
     load_trial_metrics.cache_clear()
@@ -127,6 +156,17 @@ def _safe_get(d: Dict[str, Any], path: Iterable[Any], default=None):
 
 def _parse_timestamp(value) -> pd.Timestamp:
     return pd.to_datetime(value, errors="coerce")
+
+
+def _parse_timestamps(values: List[Any]) -> List[pd.Timestamp]:
+    # One vectorized parse per session: a pd.to_datetime call per sample
+    # re-guesses the format every time (~2 ms each) and dominated load time.
+    raw = pd.Series(values, dtype=object)
+    parsed = pd.to_datetime(raw, errors="coerce", format="ISO8601")
+    unparsed = parsed.isna() & raw.notna()
+    for idx in unparsed[unparsed].index:
+        parsed[idx] = pd.to_datetime(raw[idx], errors="coerce")
+    return list(parsed)
 
 
 def _jsonable(value: Any) -> Any:
@@ -239,9 +279,19 @@ def session_status_from_raw(raw_data: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+@_serialized
 @lru_cache(maxsize=4)
 def build_sessions_index_cached(base_dir_str: str) -> pd.DataFrame:
-    return build_sessions_index(Path(base_dir_str))
+    # Building the index parses every session's JSON into load_json_cached:
+    # millions of long-lived objects. Left to the cyclic GC, each full pass
+    # re-scans them all, which slowed this parse and made everything computed
+    # afterwards ~20x slower — so pause it here and freeze them out of it.
+    gc.disable()
+    try:
+        return build_sessions_index(Path(base_dir_str))
+    finally:
+        gc.freeze()
+        gc.enable()
 
 
 def build_sessions_index(base_dir: Path) -> pd.DataFrame:
@@ -414,8 +464,9 @@ def config_to_profile_df(config: Dict[str, Any]) -> pd.DataFrame:
 def session_to_tracking_df(data: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     raw_data = data.get("raw_data") or []
+    timestamps = _parse_timestamps([rec.get("timestamp") for rec in raw_data])
     for sample_idx, rec in enumerate(raw_data):
-        ts = pd.to_datetime(rec.get("timestamp"), errors="coerce")
+        ts = timestamps[sample_idx]
         activity_data = rec.get("activity_data") or {}
         state = activity_data.get("state")
         event = activity_data.get("event")
@@ -444,6 +495,16 @@ def session_to_tracking_df(data: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
+@_serialized
+@lru_cache(maxsize=512)
+def _tracking_df_cached(path_str: str) -> pd.DataFrame:
+    return session_to_tracking_df(load_json_cached(path_str))
+
+
+def load_tracking_df(file_path: Any) -> pd.DataFrame:
+    return _tracking_df_cached(str(file_path)).copy()
+
+
 def session_to_orientation_df(data: Dict[str, Any]) -> pd.DataFrame:
     """Extract per-sample IMU quaternion yaw (heading) per tag.
 
@@ -453,8 +514,9 @@ def session_to_orientation_df(data: Dict[str, Any]) -> pd.DataFrame:
     """
     rows = []
     raw_data = data.get("raw_data") or []
+    timestamps = _parse_timestamps([rec.get("timestamp") for rec in raw_data])
     for sample_idx, rec in enumerate(raw_data):
-        ts = pd.to_datetime(rec.get("timestamp"), errors="coerce")
+        ts = timestamps[sample_idx]
         for tag in (rec.get("activity_data") or {}).get("tags_data") or []:
             quat = list(tag.get("quat_array") or [])
             if len(quat) != 4:
@@ -788,12 +850,425 @@ def compute_stop_events(speed_df: pd.DataFrame) -> Dict[str, Any]:
     return {"count": len(events), "events": events}
 
 
-def compute_border_events(tracking_df: pd.DataFrame, seeker_id: str, bbox: Optional[Dict[str, float]]) -> Dict[str, Any]:
-    if not bbox or tracking_df is None or tracking_df.empty:
-        return {"count": 0, "events": [], "inner_box": None}
-    p1 = tracking_df.loc[tracking_df["tag_id"] == seeker_id, ["t_s", "x", "y"]].dropna(subset=["x", "y"]).sort_values("t_s")
-    if p1.empty:
-        return {"count": 0, "events": [], "inner_box": None}
+# ---------------------------------------------------------------------------
+# Pauses of the hand-held unit P1 — the rule used by the dashboard.
+# compute_stop_events above is the previous rule, kept for comparison only.
+# ---------------------------------------------------------------------------
+
+def _position_segments(tag_df: pd.DataFrame) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray]], List[Tuple[float, float]]]:
+    """One tag's samples split into the stretches where its position keeps
+    updating, and the data gaps between them.
+
+    Samples whose (x, y) repeat the previous sample are dropped first: the
+    position updates less often than the 10 Hz recording, so a repeated value
+    is not a new measurement. A gap is a stretch where the position stays
+    identical for at least data_gap_min_duration_s (between two consecutive
+    remaining samples, or from the last one to the end of the recording); the
+    stretches on either side are handled separately.
+    """
+    g = tag_df[["t_s", "x", "y"]].apply(pd.to_numeric, errors="coerce").dropna().sort_values("t_s")
+    if g.empty:
+        return [], []
+    t_end = float(g["t_s"].iloc[-1])
+    repeated = (g["x"].diff() == 0) & (g["y"].diff() == 0)
+    g = g[~repeated]
+    t, x, y = g["t_s"].to_numpy(), g["x"].to_numpy(), g["y"].to_numpy()
+    gap_min = settings.data_gap_min_duration_s
+    breaks = np.where(np.diff(t) >= gap_min)[0]
+    gaps = [(float(t[i]), float(t[i + 1])) for i in breaks]
+    if t_end - t[-1] >= gap_min:
+        gaps.append((float(t[-1]), t_end))
+    bounds = [0, *(breaks + 1), len(t)]
+    segments = [(t[a:b], x[a:b], y[a:b]) for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+    return segments, gaps
+
+
+def _window_speed(t: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Speed at each sample: horizontal displacement between the samples at
+    t - window/2 and t + window/2 (the nearest ones inside the stretch),
+    divided by the real time between those two samples."""
+    half = settings.pause_window_s / 2.0
+    n = len(t)
+    ia = np.clip(np.searchsorted(t, t - half, side="right") - 1, 0, n - 1)
+    ib = np.clip(np.searchsorted(t, t + half, side="left"), 0, n - 1)
+    dt = t[ib] - t[ia]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        speed = np.hypot(x[ib] - x[ia], y[ib] - y[ia]) / dt
+    speed[dt <= 0] = np.nan
+    return speed
+
+
+def tag_window_speeds(tag_df: pd.DataFrame) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], List[Tuple[float, float]]]:
+    """(time, speed) per stretch of one tag, plus its data gaps."""
+    segments, gaps = _position_segments(tag_df)
+    return [(t, _window_speed(t, x, y)) for t, x, y in segments], gaps
+
+
+def _share_by_task(intervals: List[Tuple[float, float]], split_t_s: Optional[float]) -> Dict[str, Any]:
+    """Count and total duration of time intervals, whole and per task. An
+    interval counts in the task where it starts; its duration is shared
+    between the tasks by the time it spends in each."""
+    out: Dict[str, Any] = {"count": len(intervals), "duration_s": float(sum(b - a for a, b in intervals))}
+    if split_t_s is None:
+        out.update({"task1_count": None, "task2_count": None, "task1_duration_s": None, "task2_duration_s": None})
+        return out
+    out["task1_count"] = sum(1 for a, _ in intervals if a <= split_t_s)
+    out["task2_count"] = len(intervals) - out["task1_count"]
+    out["task1_duration_s"] = float(sum(max(0.0, min(b, split_t_s) - a) for a, b in intervals))
+    out["task2_duration_s"] = float(sum(max(0.0, b - max(a, split_t_s)) for a, b in intervals))
+    return out
+
+
+def compute_pause_events(
+    tracking_df: pd.DataFrame,
+    seeker_id: str,
+    split_t_s: Optional[float],
+    noise_threshold_m_s: float,
+    relative_fraction: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Pauses of the hand-held unit P1 (only P1: the landmark units serve only
+    to estimate the noise threshold).
+
+    P1 is paused while its window speed (_window_speed) stays below the
+    threshold for at least pause_min_duration_s. The threshold is the noise
+    threshold, or — with relative_fraction — the higher of the noise threshold
+    and relative_fraction × P1's median speed in that task (task 1 up to the
+    marked time, task 2 after; the whole recording when it has no marked
+    time), the median taken on the moving samples only (at or above the noise
+    threshold). Data gaps (position frozen for data_gap_min_duration_s or
+    more) split the stretches and are never pauses: they are reported apart.
+    """
+    p1 = tracking_df[tracking_df["tag_id"] == seeker_id] if tracking_df is not None and not tracking_df.empty else pd.DataFrame()
+    stretches, gaps = tag_window_speeds(p1) if not p1.empty else ([], [])
+
+    def task_mask(t: np.ndarray, task: Optional[int]) -> np.ndarray:
+        if task is None or split_t_s is None:
+            return np.ones(len(t), dtype=bool)
+        return t <= split_t_s if task == 1 else t > split_t_s
+
+    thresholds: Dict[str, float] = {}
+    tasks = [None] if split_t_s is None else [1, 2]
+    for task in tasks:
+        thr = float(noise_threshold_m_s)
+        if relative_fraction is not None and stretches:
+            v = np.concatenate([sp[task_mask(t, task)] for t, sp in stretches])
+            moving = v[np.isfinite(v) & (v >= noise_threshold_m_s)]
+            if moving.size:
+                thr = max(thr, float(relative_fraction) * float(np.median(moving)))
+        thresholds["whole" if task is None else f"task{task}"] = thr
+
+    pauses: List[Tuple[float, float]] = []
+    for t, sp in stretches:
+        thr = np.full(len(t), thresholds.get("whole", np.nan))
+        if split_t_s is not None:
+            thr = np.where(t <= split_t_s, thresholds["task1"], thresholds["task2"])
+        below = np.isfinite(sp) & (sp < thr)
+        i, n = 0, len(t)
+        while i < n:
+            if not below[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n and below[j + 1]:
+                j += 1
+            if t[j] - t[i] >= settings.pause_min_duration_s:
+                pauses.append((float(t[i]), float(t[j])))
+            i = j + 1
+
+    return {
+        "pauses": pauses,
+        "gaps": gaps,
+        "thresholds_m_s": thresholds,
+        "pause": _share_by_task(pauses, split_t_s),
+        "gap": _share_by_task(gaps, split_t_s),
+    }
+
+
+LANDMARK_ZONE_KEYS = (
+    "task1_time_near_landmarks_s", "task1_time_away_landmarks_s",
+    "task1_speed_near_landmarks_m_s", "task1_speed_away_landmarks_m_s",
+    "task1_intensity_near_landmarks_m_s2", "task1_intensity_away_landmarks_m_s2",
+)
+
+
+@_serialized
+@lru_cache(maxsize=4096)
+def load_landmark_zone_split(session_id: int, split_t_s: Optional[float]) -> Dict[str, Optional[float]]:
+    """Task 1 of one recording (up to the marked time) split into the time P1
+    spends near the landmarks (within landmark_near_radius_m of any of them,
+    horizontal distance) and away from them, with the speed in each part
+    (path length / time). A step between two samples belongs to the part of
+    its earlier sample. Landmark positions: the median position of each
+    landmark unit in this recording; for haptic_on_object the route's
+    protocol positions (PROTOCOL_LANDMARKS), since the units were parked at
+    the border there. All None without a marked time.
+
+    Movement intensity near / away: mean norm of P1's linear acceleration
+    over the samples near / away, samples at zero (IMU not streaming) left
+    out — same rule as movement_intensity_m_s2."""
+    out: Dict[str, Optional[float]] = {k: None for k in LANDMARK_ZONE_KEYS}
+    if split_t_s is None:
+        return out
+    row = get_sessions_df().iloc[int(session_id)]
+    config = extract_config(load_json_cached(str(row["file_path"])))
+    tracking_df = load_tracking_df(row["file_path"])
+    if _condition_factors(row["condition"]) == ("haptic", "on_object"):
+        route = actual_route(str(row["patient"]), str(row["condition"]), str(row["path_id"]))
+        landmarks = list(protocol_landmark_coordinates(route, config["target_ids"]).values())
+    else:
+        landmarks = []
+        for tid in config["target_ids"]:
+            g = tracking_df.loc[tracking_df["tag_id"] == tid, ["x", "y"]].apply(pd.to_numeric, errors="coerce").dropna()
+            if not g.empty:
+                landmarks.append([float(g["x"].median()), float(g["y"].median())])
+    xy = p1_xy(tracking_df, config["seeker_id"])
+    xy = xy[xy["t_s"] <= split_t_s].sort_values("t_s")
+    if not landmarks or len(xy) < 2:
+        return out
+    t, x, y = xy["t_s"].to_numpy(), xy["x"].to_numpy(), xy["y"].to_numpy()
+    lm = np.array(landmarks, dtype=float)
+    near = np.hypot(x[:, None] - lm[None, :, 0], y[:, None] - lm[None, :, 1]).min(axis=1) <= settings.landmark_near_radius_m
+    dt = np.diff(t)
+    step = np.hypot(np.diff(x), np.diff(y))
+    for name, mask in (("near", near[:-1]), ("away", ~near[:-1])):
+        time_s = float(dt[mask].sum())
+        out[f"task1_time_{name}_landmarks_s"] = time_s
+        out[f"task1_speed_{name}_landmarks_m_s"] = float(step[mask].sum() / time_s) if time_s > 0 else None
+
+    if "accel_norm" in tracking_df.columns:
+        acc = tracking_df.loc[tracking_df["tag_id"] == config["seeker_id"], ["t_s", "x", "y", "accel_norm"]]
+        acc = acc.apply(pd.to_numeric, errors="coerce").dropna()
+        acc = acc[(acc["t_s"] <= split_t_s) & (acc["accel_norm"] > 0)]  # zeros = IMU not streaming
+        if not acc.empty:
+            acc_near = np.hypot(
+                acc["x"].to_numpy()[:, None] - lm[None, :, 0], acc["y"].to_numpy()[:, None] - lm[None, :, 1]
+            ).min(axis=1) <= settings.landmark_near_radius_m
+            a_norm = acc["accel_norm"].to_numpy()
+            for name, mask in (("near", acc_near), ("away", ~acc_near)):
+                out[f"task1_intensity_{name}_landmarks_m_s2"] = float(a_norm[mask].mean()) if mask.any() else None
+    return out
+
+
+@_serialized
+@lru_cache(maxsize=4096)
+def load_learning_approach_depth(session_id: int, split_t_s: Optional[float]) -> Dict[str, Any]:
+    """Approach depth of a LEARNING recording, task 1, computed like the
+    experimental one: from the feedback steps up to the marked time, or —
+    for haptic_on_object — from P1's position against the route's protocol
+    landmark positions (compute_approach_depth_from_positions)."""
+    if split_t_s is None:
+        return _approach_depth_summary({})
+    row = get_sessions_df().iloc[int(session_id)]
+    data = load_json_cached(str(row["file_path"]))
+    config = extract_config(data)
+    if _condition_factors(row["condition"]) == ("haptic", "on_object"):
+        xy = p1_xy(load_tracking_df(row["file_path"]), config["seeker_id"])
+        route = actual_route(str(row["patient"]), str(row["condition"]), str(row["path_id"]))
+        coords = protocol_landmark_coordinates(route, config["target_ids"])
+        return compute_approach_depth_from_positions(xy[xy["t_s"] <= split_t_s], coords, config["distance_cfg"])
+    feedback_df = session_to_feedback_df(data)
+    if not feedback_df.empty:
+        feedback_df = feedback_df[feedback_df["t_s"] <= split_t_s]
+    return compute_approach_depth(feedback_df, config["distance_cfg"])
+
+
+def compute_stay_point_pauses(
+    tracking_df: pd.DataFrame, seeker_id: str, split_t_s: Optional[float],
+    radius_m: float, min_duration_s: float,
+) -> Dict[str, Any]:
+    """Pauses of P1 as stay points (Li et al. 2008, Mining user similarity
+    based on location history, ACM SIGSPATIAL GIS, doi:10.1145/1463434.1463477).
+
+    P1's samples go through _position_segments (repeated positions dropped,
+    stretches split at data gaps; data gaps are never pauses). Within each
+    stretch: from sample i, extend j while every next sample stays within
+    radius_m of sample i; if t[j] - t[i] >= min_duration_s, (t[i], t[j]) is a
+    pause and the scan restarts at j + 1, otherwise at i + 1. Pauses and gaps
+    are shared between the tasks like in compute_pause_events.
+    compute_pause_events (window speed below a noise threshold) is the
+    previous rule, kept for comparison only.
+
+    The stillness at the very start and end of a recording is not counted: a
+    pause starting at the first sample of the first stretch is the wait
+    between Start and the participant walking off, and one ending at the last
+    sample of the last stretch is the wait before the operator pressed Stop.
+    Both describe the operator, not the walk ("edge_pauses" lists them).
+    """
+    p1 = tracking_df[tracking_df["tag_id"] == seeker_id] if tracking_df is not None and not tracking_df.empty else pd.DataFrame()
+    segments, gaps = _position_segments(p1) if not p1.empty else ([], [])
+    pauses: List[Tuple[float, float]] = []
+    for t, x, y in segments:
+        n, i = len(t), 0
+        while i < n:
+            j = i
+            while j + 1 < n and math.hypot(x[j + 1] - x[i], y[j + 1] - y[i]) <= radius_m:
+                j += 1
+            if t[j] - t[i] >= min_duration_s:
+                pauses.append((float(t[i]), float(t[j])))
+                i = j + 1
+            else:
+                i += 1
+    edge_pauses: List[Tuple[float, float]] = []
+    if segments and pauses:
+        first_t, last_t = float(segments[0][0][0]), float(segments[-1][0][-1])
+        edge_pauses = [p for p in pauses if p[0] == first_t or p[1] == last_t]
+        pauses = [p for p in pauses if not (p[0] == first_t or p[1] == last_t)]
+    return {
+        "pauses": pauses,
+        "edge_pauses": edge_pauses,
+        "gaps": gaps,
+        "pause": _share_by_task(pauses, split_t_s),
+        "gap": _share_by_task(gaps, split_t_s),
+    }
+
+
+PAUSE_METRIC_KEYS = tuple(
+    f"{scope}{kind}_{measure}"
+    for scope in ("", "task1_", "task2_")
+    for kind in ("pause", "data_gap")
+    for measure in ("count", "duration_s")
+)
+
+
+@_serialized
+@lru_cache(maxsize=4096)
+def load_pause_metrics(
+    session_id: int, split_t_s: Optional[float], radius_m: float, min_duration_s: float,
+) -> Dict[str, Any]:
+    """Pause (stay points, compute_stay_point_pauses) and data-gap count and
+    duration of P1 for one recording, whole and per task (PAUSE_METRIC_KEYS),
+    cached. The rule settings are arguments so a change is never served from
+    the cache."""
+    row = get_sessions_df().iloc[int(session_id)]
+    config = extract_config(load_json_cached(str(row["file_path"])))
+    res = compute_stay_point_pauses(load_tracking_df(row["file_path"]), config["seeker_id"], split_t_s, radius_m, min_duration_s)
+    out: Dict[str, Any] = {}
+    for kind, key in (("pause", "pause"), ("data_gap", "gap")):
+        for scope in ("", "task1_", "task2_"):
+            for measure in ("count", "duration_s"):
+                out[f"{scope}{kind}_{measure}"] = res[key][f"{scope}{measure}"]
+    return out
+
+
+def _analysis_recordings() -> List[Dict[str, Any]]:
+    """The recordings included in the analysis: those of included
+    participants, not flagged as too short, and not part of a trial excluded
+    from the statistics (both the excluded exploration attempt and its
+    learning reference)."""
+    sessions_df = get_sessions_df()
+    if sessions_df.empty:
+        return []
+    inclusion = load_inclusion()
+    excluded: set = set()
+    trials_df = build_trials_df()
+    for _, r in trials_df.iterrows():
+        exp_id = int(r["exploration_session_id"]) if pd.notna(r["exploration_session_id"]) else None
+        if get_annotation(r["patient"], r["condition"], r["path_id"], exp_id).get("excluded_from_stats"):
+            if exp_id is not None:
+                excluded.add(exp_id)
+            if pd.notna(r["learning_session_id"]):
+                excluded.add(int(r["learning_session_id"]))
+    out = []
+    for _, row in sessions_df.iterrows():
+        if inclusion.get(row["patient"], True) is False or bool(row.get("is_suspicious_short")) or int(row["session_id"]) in excluded:
+            continue
+        out.append(row.to_dict())
+    return out
+
+
+def _noise_signature(recordings: List[Dict[str, Any]]) -> str:
+    import hashlib
+    h = hashlib.sha1()
+    h.update(f"{settings.pause_window_s}|{settings.pause_noise_percentile}|{settings.data_gap_min_duration_s}".encode())
+    for r in sorted(recordings, key=lambda r: r["file_name"]):
+        try:
+            st = Path(r["file_path"]).stat()
+            h.update(f"{r['file_name']}|{st.st_size}|{int(st.st_mtime)}|{r.get('phase')}".encode())
+        except OSError:
+            h.update(str(r["file_name"]).encode())
+    return h.hexdigest()
+
+
+def compute_pause_noise_threshold(recordings: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Position-noise threshold for the pauses, from the landmark units O1-O3,
+    which stay still: their window speed (same method as P1) is only noise.
+    Outside haptic_on_object (units parked at the border there), on every
+    recording included in the analysis. The threshold is the
+    pause_noise_percentile of all their samples."""
+    recordings = _analysis_recordings() if recordings is None else recordings
+    speeds: List[np.ndarray] = []
+    used = 0
+    for r in recordings:
+        if str(r.get("condition") or "").startswith("haptic_on_object"):
+            continue
+        try:
+            config = extract_config(load_json_cached(str(r["file_path"])))
+            tracking_df = load_tracking_df(r["file_path"])
+        except Exception:
+            continue
+        got = False
+        for tid in config["target_ids"]:
+            stretches, _ = tag_window_speeds(tracking_df[tracking_df["tag_id"] == tid])
+            for _, sp in stretches:
+                sp = sp[np.isfinite(sp)]
+                if sp.size:
+                    speeds.append(sp)
+                    got = True
+        used += int(got)
+    v = np.concatenate(speeds) if speeds else np.array([])
+    pct = settings.pause_noise_percentile
+    return {
+        "value_m_s": float(np.percentile(v, pct)) if v.size else None,
+        "percentile": pct,
+        "median_m_s": float(np.median(v)) if v.size else None,
+        "p90_m_s": float(np.percentile(v, 90)) if v.size else None,
+        "p95_m_s": float(np.percentile(v, 95)) if v.size else None,
+        "n_recordings": used,
+        "n_samples": int(v.size),
+        "method": (
+            f"{pct:g}th percentile of the window speed (horizontal displacement over "
+            f"{settings.pause_window_s:g} s, repeated positions dropped, data gaps of "
+            f"{settings.data_gap_min_duration_s:g} s or more split) of the still landmark "
+            "units O1-O3, outside haptic_on_object, on every recording included in the analysis"
+        ),
+    }
+
+
+@lru_cache(maxsize=1)
+def get_pause_noise_threshold() -> Dict[str, Any]:
+    """The stored noise threshold (pause_noise_threshold_path), computed again
+    and saved when the recordings, inclusions, exclusions or the method
+    settings have changed since it was stored."""
+    recordings = _analysis_recordings()
+    signature = _noise_signature(recordings)
+    path = settings.pause_noise_threshold_path
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+    except Exception:
+        stored = None
+    if stored and stored.get("signature") == signature and stored.get("value_m_s") is not None:
+        return stored
+    result = compute_pause_noise_threshold(recordings)
+    result["signature"] = signature
+    result["computed_at"] = pd.Timestamp.now().isoformat(timespec="seconds")
+    try:
+        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    return result
+
+
+def pause_settings() -> Tuple[float, Optional[float]]:
+    """(noise threshold, relative fraction or None) of the previous pause rule
+    (compute_pause_events), kept for comparison only: the pauses now use
+    stay points (compute_stay_point_pauses)."""
+    noise = get_pause_noise_threshold().get("value_m_s")
+    noise = float(noise) if noise is not None else settings.stop_speed_threshold_m_s
+    fraction = settings.pause_relative_fraction if settings.pause_relative_enabled else None
+    return noise, fraction
+
+
+def _border_inner_box(bbox: Dict[str, float]) -> Dict[str, float]:
     x_span = bbox["x_max"] - bbox["x_min"]
     y_span = bbox["y_max"] - bbox["y_min"]
     # Longer anchor-span axis gets the larger margin (e.g. 12 m axis -> 8 m inner span);
@@ -802,14 +1277,90 @@ def compute_border_events(tracking_df: pd.DataFrame, seeker_id: str, bbox: Optio
         margin_x, margin_y = settings.border_margin_long_m, settings.border_margin_short_m
     else:
         margin_x, margin_y = settings.border_margin_short_m, settings.border_margin_long_m
-    inner = {
+    return {
         "x_min": bbox["x_min"] + margin_x, "x_max": bbox["x_max"] - margin_x,
         "y_min": bbox["y_min"] + margin_y, "y_max": bbox["y_max"] - margin_y,
     }
+
+
+def _border_p1(tracking_df: pd.DataFrame, seeker_id: str) -> pd.DataFrame:
+    return tracking_df.loc[tracking_df["tag_id"] == seeker_id, ["t_s", "x", "y"]].dropna(subset=["x", "y"]).sort_values("t_s")
+
+
+def compute_border_events(tracking_df: pd.DataFrame, seeker_id: str, bbox: Optional[Dict[str, float]]) -> Dict[str, Any]:
+    """Border crossings of P1 with a spatial hysteresis of border_hysteresis_m.
+
+    d_out = signed distance outside the inner box (positive outside,
+    negative inside). A crossing starts when d_out > +h; the next one can only
+    start after P1 has come back with d_out < -h. Each event keeps t_s (start)
+    and end_t_s (first sample back below -h, or the last sample). count =
+    number of starts. The previous rule (0.3 s merge) is
+    compute_border_events_merge, kept for comparison only.
+    """
+    if not bbox or tracking_df is None or tracking_df.empty:
+        return {"count": 0, "events": [], "inner_box": None}
+    p1 = _border_p1(tracking_df, seeker_id)
+    if p1.empty:
+        return {"count": 0, "events": [], "inner_box": None}
+    inner = _border_inner_box(bbox)
+    x, y, t = p1["x"].to_numpy(dtype=float), p1["y"].to_numpy(dtype=float), p1["t_s"].to_numpy(dtype=float)
+    d_out = np.max(np.stack([inner["x_min"] - x, x - inner["x_max"], inner["y_min"] - y, y - inner["y_max"]]), axis=0)
+    h = settings.border_hysteresis_m
+    events: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    for ti, di in zip(t, d_out):
+        if current is None:
+            if di > h:
+                current = {"t_s": float(ti), "end_t_s": float(ti)}
+                events.append(current)
+        elif di < -h:
+            current["end_t_s"] = float(ti)
+            current = None
+    if current is not None:
+        current["end_t_s"] = float(t[-1])
+    return {"count": len(events), "events": events, "inner_box": inner}
+
+
+def compute_border_events_merge(tracking_df: pd.DataFrame, seeker_id: str, bbox: Optional[Dict[str, float]]) -> Dict[str, Any]:
+    """Previous border rule, kept for comparison only: every sample outside
+    the inner box, merged into one event when less than 0.3 s apart."""
+    if not bbox or tracking_df is None or tracking_df.empty:
+        return {"count": 0, "events": [], "inner_box": None}
+    p1 = _border_p1(tracking_df, seeker_id)
+    if p1.empty:
+        return {"count": 0, "events": [], "inner_box": None}
+    inner = _border_inner_box(bbox)
     outside = (p1["x"] < inner["x_min"]) | (p1["x"] > inner["x_max"]) | (p1["y"] < inner["y_min"]) | (p1["y"] > inner["y_max"])
     items = [{"t_s": float(t)} for t in p1.loc[outside, "t_s"].dropna().to_numpy()]
     events = merge_events(items, time_key="t_s", gap_s=0.3)
     return {"count": len(events), "events": events, "inner_box": inner}
+
+
+BORDER_COUNT_KEYS = (
+    "border_reached_count", "task1_border_reached_count", "task2_border_reached_count",
+    "border_reached_count_merge", "task1_border_reached_count_merge", "task2_border_reached_count_merge",
+)
+
+
+@_serialized
+@lru_cache(maxsize=4096)
+def load_border_counts(session_id: int, split_t_s: Optional[float]) -> Dict[str, Optional[int]]:
+    """Border crossings of P1 in one recording, whole and per task (a crossing
+    belongs to the task in which it STARTS), with the current rule and, under
+    *_merge, the previous 0.3 s merge rule for comparison. Per-task values
+    are None without a marked time."""
+    row = get_sessions_df().iloc[int(session_id)]
+    config = extract_config(load_json_cached(str(row["file_path"])))
+    tracking_df = load_tracking_df(row["file_path"])
+    bbox = compute_room_bbox(config["anchors"])
+    out: Dict[str, Optional[int]] = {}
+    for suffix, fn in (("", compute_border_events), ("_merge", compute_border_events_merge)):
+        events = fn(tracking_df, config["seeker_id"], bbox)["events"]
+        out[f"border_reached_count{suffix}"] = len(events)
+        task1 = None if split_t_s is None else sum(1 for ev in events if ev["t_s"] <= split_t_s)
+        out[f"task1_border_reached_count{suffix}"] = task1
+        out[f"task2_border_reached_count{suffix}"] = None if task1 is None else len(events) - task1
+    return out
 
 
 def session_to_feedback_df(data: Dict[str, Any]) -> pd.DataFrame:
@@ -835,6 +1386,13 @@ def session_to_feedback_df(data: Dict[str, Any]) -> pd.DataFrame:
 
 
 def compute_distances(tracking_df: pd.DataFrame, seeker_id: str = "P1", target_ids: Optional[List[str]] = None) -> pd.DataFrame:
+    """Distance between the seeker and each landmark unit at every timestamp,
+    on the horizontal plane (x, y) only — same choice as the route length.
+    The vertical coordinate is left out: the seeker holds P1 in the hand, well
+    above the units on the floor (about 0.75 m, and noisy), which made the
+    3D distance some 0.4 m longer than the one the feedback itself works on.
+    The horizontal distance matches the distance logged in the
+    feedback_changed events."""
     if tracking_df.empty:
         return pd.DataFrame()
     if target_ids is None:
@@ -846,11 +1404,7 @@ def compute_distances(tracking_df: pd.DataFrame, seeker_id: str = "P1", target_i
     merged = targets.merge(p1, on="timestamp", how="inner")
     if merged.empty:
         return pd.DataFrame()
-    merged["distance"] = np.sqrt(
-        (merged["x"] - merged["p1_x"]) ** 2 +
-        (merged["y"] - merged["p1_y"]) ** 2 +
-        (merged["z"] - merged["p1_z"]) ** 2
-    )
+    merged["distance"] = np.hypot(merged["x"] - merged["p1_x"], merged["y"] - merged["p1_y"])
     return merged[["timestamp", "t_s", "target_id", "distance", "x", "y", "z", "p1_x", "p1_y", "p1_z"]].sort_values(["timestamp", "target_id"]).reset_index(drop=True)
 
 
@@ -870,13 +1424,93 @@ def compute_speed_df(tracking_df: pd.DataFrame, seeker_id: str = "P1", rolling_w
         return pd.DataFrame()
     p1 = p1.sort_values("timestamp")
     p1["dt_s"] = p1["timestamp"].diff().dt.total_seconds()
-    p1["dx"] = p1["x"].diff(); p1["dy"] = p1["y"].diff(); p1["dz"] = p1["z"].diff()
-    p1["step_distance"] = np.sqrt(p1["dx"] ** 2 + p1["dy"] ** 2 + p1["dz"] ** 2)
+    # Horizontal plane only: the hand-held unit's height changes are not walking.
+    p1["dx"] = p1["x"].diff(); p1["dy"] = p1["y"].diff()
+    p1["step_distance"] = np.hypot(p1["dx"], p1["dy"])
     p1["speed_m_s"] = p1["step_distance"] / p1["dt_s"]
     bad_speed = (p1["dt_s"] <= 0) | (~np.isfinite(p1["speed_m_s"]))
     p1.loc[bad_speed, "speed_m_s"] = np.nan
     p1["speed_m_s_smooth"] = p1["speed_m_s"].rolling(rolling_window, min_periods=1).median()
     return p1[["timestamp", "t_s", "x", "y", "z", "dt_s", "step_distance", "speed_m_s", "speed_m_s_smooth"]]
+
+
+def split_time_for_file(file_name: Any, splits: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[float]:
+    """The manually marked time (s from the start of the recording) that
+    separates the two tasks of a recording — None when it has not been marked."""
+    record = (splits if splits is not None else load_task_splits()).get(str(file_name))
+    t_s = record.get("t_s") if isinstance(record, dict) else None
+    return float(t_s) if t_s is not None else None
+
+
+TASK_SEGMENT_KEYS = (
+    "task1_length_m", "task1_duration_s", "task1_speed_m_s",
+    "task2_length_m", "task2_duration_s", "task2_speed_m_s",
+    "task1_movement_intensity_m_s2", "task2_movement_intensity_m_s2",
+    "task1_stop_count", "task2_stop_count",
+    "task1_stop_duration_s", "task2_stop_duration_s",
+)
+
+
+@_serialized
+@lru_cache(maxsize=4096)
+def load_task_segments(session_id: int, split_t_s: Optional[float]) -> Dict[str, Optional[float]]:
+    """Length, duration and mean speed of the two tasks of one recording:
+    task 1 from its start to the marked time (S, the three landmarks, E),
+    task 2 from the marked time to its end (walk back from E to S).
+
+    Same definitions as the whole-recording values: length = sum of the
+    seeker's steps on the horizontal plane, speed = length / duration. A step
+    belongs to task 1 when it ends at or before the marked time. All None when
+    the recording has no marked time — never estimated.
+
+    Also, per task:
+    - movement intensity (m/s²): mean of the norm of the hand-held unit's
+      linear acceleration (the seeker's accel_norm), leaving out the samples
+      at zero (IMU not streaming) — same samples as max_accel_norm.
+    - stops (compute_stop_events): how many, and their total duration. A stop
+      is counted in the task where it STARTS, so the two counts add up to the
+      whole recording; its duration is shared between the tasks by the time
+      it actually spends in each, when it runs across the marked time.
+    """
+    empty: Dict[str, Optional[float]] = {k: None for k in TASK_SEGMENT_KEYS}
+    if split_t_s is None:
+        return empty
+    row = get_sessions_df().iloc[int(session_id)]
+    config = extract_config(load_json_cached(str(row["file_path"])))
+    tracking_df = load_tracking_df(row["file_path"])
+    speed_df = compute_speed_df(tracking_df, seeker_id=config["seeker_id"])
+    if speed_df.empty:
+        return empty
+    t = pd.to_numeric(speed_df["t_s"], errors="coerce").to_numpy()
+    step = pd.to_numeric(speed_df["step_distance"], errors="coerce").to_numpy()
+    t_first, t_last = float(np.nanmin(t)), float(np.nanmax(t))
+    split = min(max(float(split_t_s), t_first), t_last)
+    in_task1 = t <= split
+    out: Dict[str, Optional[float]] = dict(empty)
+    for name, mask, duration in (("task1", in_task1, split - t_first), ("task2", ~in_task1, t_last - split)):
+        length = float(np.nansum(step[mask]))
+        out[f"{name}_length_m"] = length
+        out[f"{name}_duration_s"] = float(duration)
+        out[f"{name}_speed_m_s"] = float(length / duration) if duration > 0 else None
+
+    if "accel_norm" in tracking_df.columns:
+        seeker = tracking_df.loc[tracking_df["tag_id"] == config["seeker_id"], ["t_s", "accel_norm"]]
+        accel = pd.to_numeric(seeker["accel_norm"], errors="coerce")
+        accel_t = pd.to_numeric(seeker["t_s"], errors="coerce")
+        streaming = accel > 0  # zeros = IMU not streaming
+        for name, mask in (("task1", accel_t <= split), ("task2", accel_t > split)):
+            values = accel[streaming & mask]
+            out[f"{name}_movement_intensity_m_s2"] = float(values.mean()) if not values.empty else None
+
+    # Same speed smoothing as the whole-recording stop count.
+    stops = compute_stop_events(
+        compute_speed_df(tracking_df, seeker_id=config["seeker_id"], rolling_window=settings.speed_rolling_window)
+    )["events"]
+    out["task1_stop_count"] = sum(1 for ev in stops if ev["t_s"] <= split)
+    out["task2_stop_count"] = len(stops) - out["task1_stop_count"]
+    out["task1_stop_duration_s"] = float(sum(max(0.0, min(ev["end_t_s"], split) - ev["t_s"]) for ev in stops))
+    out["task2_stop_duration_s"] = float(sum(max(0.0, ev["end_t_s"] - max(ev["t_s"], split)) for ev in stops))
+    return out
 
 
 def add_ewma_plot_columns(
@@ -958,6 +1592,7 @@ def metric_summary(
         "max_speed_m_s": None,
         "total_distance_m": None,
         "max_accel_norm": None,
+        "movement_intensity_m_s2": None,
         "feedback_events_per_min": None,
     }
     duration_s = summary.get("duration_s")
@@ -974,17 +1609,24 @@ def metric_summary(
         metrics["mean_closest_distance"] = _jsonable(pd.to_numeric(closest_df["closest_distance"], errors="coerce").mean())
         metrics["min_closest_distance"] = _jsonable(pd.to_numeric(closest_df["closest_distance"], errors="coerce").min())
     if speed_df is not None and not speed_df.empty:
-        metrics["mean_speed_m_s"] = _jsonable(pd.to_numeric(speed_df["speed_m_s_smooth"], errors="coerce").mean())
         metrics["max_speed_m_s"] = _jsonable(pd.to_numeric(speed_df["speed_m_s_smooth"], errors="coerce").max())
-        metrics["total_distance_m"] = _jsonable(pd.to_numeric(speed_df["step_distance"], errors="coerce").sum())
+        total_distance_m = pd.to_numeric(speed_df["step_distance"], errors="coerce").sum()
+        metrics["total_distance_m"] = _jsonable(total_distance_m)
+        # Walking speed = trajectory length / recording duration (not the mean
+        # of the per-sample speeds, which weights every sample equally).
+        if duration_s and duration_s > 0:
+            metrics["mean_speed_m_s"] = _jsonable(total_distance_m / duration_s)
     if tracking_df is not None and not tracking_df.empty and seeker_id is not None and "accel_norm" in tracking_df.columns:
         seeker_accel = pd.to_numeric(tracking_df.loc[tracking_df["tag_id"] == seeker_id, "accel_norm"], errors="coerce")
         seeker_accel = seeker_accel[seeker_accel > 0]  # zeros = IMU not streaming
         if not seeker_accel.empty:
             metrics["max_accel_norm"] = _jsonable(seeker_accel.max())
+            # Movement intensity = mean of the same samples (m/s²).
+            metrics["movement_intensity_m_s2"] = _jsonable(seeker_accel.mean())
     return metrics
 
 
+@_serialized
 @lru_cache(maxsize=2048)
 def load_session_metrics(session_id: int) -> Dict[str, Any]:
     """Metrics only depend on the raw file, so cache them: comparisons across
@@ -1004,7 +1646,7 @@ def _load_session_metrics_uncached(session_id: int) -> Dict[str, Any]:
     for key in ["patient", "phase", "condition", "condition_label", "path_id", "start_time"]:
         if summary.get(key) in (None, "unknown", "") and key in row.index:
             summary[key] = row[key]
-    tracking_df = session_to_tracking_df(data)
+    tracking_df = load_tracking_df(file_path)
     feedback_df = session_to_feedback_df(data)
     dist_df = compute_distances(tracking_df, seeker_id=config["seeker_id"], target_ids=config["target_ids"])
     closest_df = compute_closest_target_df(dist_df)
@@ -1031,7 +1673,7 @@ def load_session_payload(
         if summary.get(key) in (None, "unknown", "") and key in row.index:
             summary[key] = row[key]
 
-    tracking_df = session_to_tracking_df(data)
+    tracking_df = load_tracking_df(file_path)
     feedback_df = session_to_feedback_df(data)
     orientation_df = session_to_orientation_df(data)
     dist_df = compute_distances(tracking_df, seeker_id=config["seeker_id"], target_ids=config["target_ids"])
@@ -1103,9 +1745,11 @@ def compare_sessions(
         df = df[~df["is_interrupt"] & ~df["is_suspicious_short"]]
 
     results: List[Dict[str, Any]] = []
+    splits = load_task_splits()
     for _, r in df.iterrows():
+        split_t_s = split_time_for_file(r["file_name"], splits)
         try:
-            m = load_session_metrics(int(r["session_id"]))
+            m = {**load_session_metrics(int(r["session_id"])), **load_task_segments(int(r["session_id"]), split_t_s)}
         except Exception as exc:
             m = {"error": str(exc)}
         results.append({
@@ -1117,6 +1761,7 @@ def compare_sessions(
             "path_id": _jsonable(r["path_id"]),
             "start_time": _jsonable(r["start_time"]),
             "warning": _jsonable(r["warning"]),
+            "split_t_s": split_t_s,
             **{k: _jsonable(v) for k, v in m.items()},
         })
     return results
@@ -1130,13 +1775,22 @@ def build_trials_df() -> pd.DataFrame:
     (chronologically); if none qualify, fall back to the last one anyway and flag it.
     Trials with zero exploration sessions still get one row (exploration_session_id=None)
     so they aren't silently dropped from the table.
+
+    A trial with a manual pin (recording_pins.json) uses the pinned recording
+    instead: the pinned learning one is the reference of every row of the
+    trial, and the pinned exploration one is moved to the LAST row of the
+    trial, since every consumer takes the last valid row as "the" attempt
+    (it keeps its chronological attempt_number). A pin naming a file that is
+    not a recording of that trial and phase is ignored.
     """
     sessions_df = get_sessions_df()
     if sessions_df.empty:
         return pd.DataFrame()
 
+    pins = load_recording_pins()
     rows: List[Dict[str, Any]] = []
     for (patient, condition, path_id), g in sessions_df.groupby(["patient", "condition", "path_id"], dropna=False):
+        pin = pins.get(pin_key(str(patient), str(condition), str(path_id)), {})
         condition_label = g["condition_label"].iloc[0] if "condition_label" in g else pretty_condition(condition)
         learning = g[g["phase"] == "learning"].sort_values("start_time_dt")
         exploration = g[g["phase"] == "exploration"].sort_values("start_time_dt")
@@ -1150,11 +1804,21 @@ def build_trials_df() -> pd.DataFrame:
             learning_session_id = int(ref["session_id"])
             learning_is_interrupt = bool(ref["is_interrupt"])
             learning_reference_flagged = non_interrupt.empty
+        learning_pinned = False
+        pinned_learning = learning[learning["file_name"] == pin.get("learning")]
+        if not pinned_learning.empty:
+            ref = pinned_learning.iloc[-1]
+            learning_session_id = int(ref["session_id"])
+            learning_is_interrupt = bool(ref["is_interrupt"])
+            learning_reference_flagged = False
+            learning_pinned = True
 
         base = {
             "patient": patient, "condition": condition, "condition_label": condition_label, "path_id": path_id,
             "learning_session_id": learning_session_id,
             "learning_reference_flagged": learning_reference_flagged,
+            "learning_pinned": learning_pinned,
+            "exploration_pinned": False,
         }
 
         total_attempts = int(len(exploration))
@@ -1168,15 +1832,23 @@ def build_trials_df() -> pd.DataFrame:
             })
             continue
 
+        pinned_file = pin.get("exploration") if (exploration["file_name"] == pin.get("exploration")).any() else None
+        trial_rows: List[Dict[str, Any]] = []
         for attempt_number, (_, exp_row) in enumerate(exploration.iterrows(), start=1):
-            attempt_lost = bool(exp_row["is_interrupt"]) or bool(exp_row["is_suspicious_short"]) or attempt_number < total_attempts
-            rows.append({
+            is_pinned = pinned_file is not None and exp_row["file_name"] == pinned_file
+            # The attempt in use is the pinned one, else the latest; any other is superseded.
+            superseded = (not is_pinned) if pinned_file is not None else attempt_number < total_attempts
+            attempt_lost = bool(exp_row["is_interrupt"]) or bool(exp_row["is_suspicious_short"]) or superseded
+            trial_rows.append({
                 **base,
                 "exploration_session_id": int(exp_row["session_id"]),
                 "attempt_number": attempt_number, "total_attempts": total_attempts,
                 "attempt_lost": attempt_lost,
                 "trial_got_lost": attempt_lost or learning_is_interrupt,
+                "exploration_pinned": is_pinned,
             })
+        trial_rows.sort(key=lambda row: row["exploration_pinned"])  # stable: pinned row last
+        rows.extend(trial_rows)
     return pd.DataFrame(rows)
 
 
@@ -1431,6 +2103,17 @@ def dtw_distance(p: np.ndarray, q: np.ndarray) -> float:
         dtw(i,j) = d(p_i, q_j) + min(dtw(i-1,j), dtw(i-1,j-1), dtw(i,j-1))
     Result = dtw(n,m) / n.
     """
+    return dtw_alignment(p, q)[0]
+
+
+# Distances (m) within which a DTW-matched pair of points counts as corresponding.
+DTW_MATCH_RADII_M = (0.5, 1.0)
+
+
+def dtw_alignment(p: np.ndarray, q: np.ndarray) -> Tuple[float, np.ndarray]:
+    """dtw_distance (cost / n) and the distance of every matched pair along
+    the optimal DTW path (traced back from (n, m) to (1, 1); on ties the
+    diagonal step is preferred)."""
     n, m = len(p), len(q)
     d = np.hypot(p[:, None, 0] - q[None, :, 0], p[:, None, 1] - q[None, :, 1]).tolist()
     inf = float("inf")
@@ -1440,7 +2123,28 @@ def dtw_distance(p: np.ndarray, q: np.ndarray) -> float:
         dtw_i, dtw_im1, d_im1 = dtw[i], dtw[i - 1], d[i - 1]
         for j in range(1, m + 1):
             dtw_i[j] = d_im1[j - 1] + min(dtw_im1[j], dtw_im1[j - 1], dtw_i[j - 1])
-    return float(dtw[n][m] / n)
+    pair_distances = []
+    i, j = n, m
+    while i > 0 and j > 0:
+        pair_distances.append(d[i - 1][j - 1])
+        diag, up, left = dtw[i - 1][j - 1], dtw[i - 1][j], dtw[i][j - 1]
+        if diag <= up and diag <= left:
+            i, j = i - 1, j - 1
+        elif up <= left:
+            i -= 1
+        else:
+            j -= 1
+    return float(dtw[n][m] / n), np.array(pair_distances[::-1])
+
+
+def dtw_match_pcts(pair_distances: np.ndarray) -> Dict[str, Optional[float]]:
+    """Correspondence index: share (%) of the DTW-matched pairs of points that
+    are within each of DTW_MATCH_RADII_M of each other."""
+    out: Dict[str, Optional[float]] = {}
+    for r in DTW_MATCH_RADII_M:
+        key = f"{r:g}".replace(".", "")
+        out[key] = float(100.0 * np.mean(pair_distances <= r)) if pair_distances.size else None
+    return out
 
 
 def lcss_similarity_pct(p: np.ndarray, q: np.ndarray, epsilon: float) -> float:
@@ -1474,13 +2178,24 @@ def lcss_similarity_pct(p: np.ndarray, q: np.ndarray, epsilon: float) -> float:
     return float(100.0 * lcss[n][m] / min(n, m))
 
 
-def compute_trial_metrics(learning_session_id: Optional[int], exploration_session_id: Optional[int]) -> Dict[str, Any]:
+def compute_trial_metrics(
+    learning_session_id: Optional[int],
+    exploration_session_id: Optional[int],
+    learning_split_t_s: Optional[float] = None,
+    exploration_split_t_s: Optional[float] = None,
+) -> Dict[str, Any]:
     """Compare an exploration trajectory against its trial's learning trajectory:
-    route overlap, turn-by-turn deviation, and stop/start position drift."""
+    route overlap, turn-by-turn deviation, and stop/start position drift.
+
+    The route comparison (overlap, shape, Fréchet, DTW, LCSS) and the distance
+    from the end point use only task 1 of each recording — its samples up to
+    the manually marked time — cut BEFORE resampling. They stay None unless
+    both recordings have a marked time: nothing is estimated."""
     empty = {
         "overlap_pct": None, "mean_deviation_m": None,
         "shape_overlap_pct": None, "shape_deviation_m": None, "frechet_distance_m": None,
-        "dtw_distance_m": None, "lcss_pct": None, "shape_deviation_profile": None,
+        "dtw_distance_m": None, "dtw_task2_distance_m": None,
+        "dtw_match_05m_pct": None, "dtw_match_1m_pct": None, "dtw_task2_match_05m_pct": None, "dtw_task2_match_1m_pct": None, "lcss_pct": None, "shape_deviation_profile": None,
         "learn_resampled_xy": None, "exp_resampled_xy": None,
         "turns": [], "wrong_turns_count": None, "mean_turn_deviation_deg": None,
         "stop_position_distance_m": None, "start_position_distance_m": None,
@@ -1488,6 +2203,7 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
         "return_to_start_distance_m": None, "self_return_distance_m": None,
         "target_discovery": None, "target_impacts": {},
         "ideal_path_length_m": None,
+        "learning_split_xy": None, "exploration_split_xy": None, "exploration_end_xy": None, "exploration_start_xy": None,
     }
     if learning_session_id is None or exploration_session_id is None:
         return {**empty, "note": "missing learning or exploration session for this trial"}
@@ -1500,8 +2216,8 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
     learn_config = extract_config(learn_data)
     exp_config = extract_config(exp_data)
 
-    exp_tracking_df = session_to_tracking_df(exp_data)
-    learn_tracking_df = session_to_tracking_df(learn_data)
+    exp_tracking_df = load_tracking_df(exp_row["file_path"])
+    learn_tracking_df = load_tracking_df(learn_row["file_path"])
     learn_xy = p1_xy(learn_tracking_df, learn_config["seeker_id"])
     exp_xy = p1_xy(exp_tracking_df, exp_config["seeker_id"])
     if learn_xy.empty or exp_xy.empty:
@@ -1511,37 +2227,86 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
     # the learning session itself (not the raw hider_sequence_id config field
     # — see learning_target_order's docstring for why that's the wrong source).
     intended_order = learning_target_order(session_to_feedback_df(learn_data), learn_config["target_ids"])
-    target_discovery = compute_target_discovery(session_to_feedback_df(exp_data), intended_order)
+    # Landmarks belong to task 1: only the signals up to the marked point E
+    # count (participants pass near them again while walking back). Whole
+    # recording when E is not marked.
+    exp_feedback_df = session_to_feedback_df(exp_data)
+    if exploration_split_t_s is not None and not exp_feedback_df.empty and "t_s" in exp_feedback_df:
+        exp_feedback_df = exp_feedback_df[exp_feedback_df["t_s"] <= exploration_split_t_s]
+    target_discovery = compute_target_discovery(exp_feedback_df, intended_order)
     target_impacts = compute_target_impacts(exp_tracking_df, exp_config["seeker_id"], exp_config["target_ids"])
 
     lx, ly = learn_xy["x"].to_numpy(), learn_xy["y"].to_numpy()
     ex, ey = exp_xy["x"].to_numpy(), exp_xy["y"].to_numpy()
 
-    # Overlap: fraction of exploration points that fall within the buffer distance
-    # of the learning trajectory (nearest-neighbor distance, point-wise). Vectorized
-    # pairwise distance matrix instead of a Python-level loop: with sessions running
-    # into thousands of samples, a per-point loop held the GIL long enough to stall
-    # other concurrent requests (e.g. a rapid sequence of dropdown changes).
-    min_dist = np.hypot(ex[:, None] - lx[None, :], ey[:, None] - ly[None, :]).min(axis=1)
-    overlap_pct = float(100.0 * np.mean(min_dist <= settings.trial_overlap_buffer_m))
-    mean_deviation_m = float(min_dist.mean())
+    # Task 1 of each recording: its samples up to the manually marked time.
+    def _task1(xy: pd.DataFrame, split_t_s: Optional[float]) -> Optional[np.ndarray]:
+        if split_t_s is None:
+            return None
+        part = xy[xy["t_s"] <= split_t_s]
+        return part[["x", "y"]].to_numpy() if not part.empty else None
 
-    # Shape overlap: same buffer threshold as above, but point-by-point at the
-    # same relative position along each route (arc-length resampled) instead
-    # of nearest-neighbor-anywhere-on-the-route — this respects order/direction,
-    # so wandering back and forth in the same general area (which can score
-    # high on overlap_pct) doesn't score high here unless it's the same shape.
-    n_pts = settings.trial_shape_resample_points
-    learn_resampled = resample_by_arclength(np.column_stack([lx, ly]), n_pts)
-    exp_resampled = resample_by_arclength(np.column_stack([ex, ey]), n_pts)
-    pointwise_dist = np.hypot(
-        exp_resampled[:, 0] - learn_resampled[:, 0], exp_resampled[:, 1] - learn_resampled[:, 1]
-    )
-    shape_overlap_pct = float(100.0 * np.mean(pointwise_dist <= settings.trial_overlap_buffer_m))
-    shape_deviation_m = float(pointwise_dist.mean())
-    frechet_distance_m = discrete_frechet_distance(learn_resampled, exp_resampled)
-    dtw_distance_m = dtw_distance(learn_resampled, exp_resampled)
-    lcss_pct = lcss_similarity_pct(learn_resampled, exp_resampled, settings.trial_overlap_buffer_m)
+    learn_task1 = _task1(learn_xy, learning_split_t_s)
+    exp_task1 = _task1(exp_xy, exploration_split_t_s)
+    learning_split_xy = [float(learn_task1[-1, 0]), float(learn_task1[-1, 1])] if learn_task1 is not None else None
+    exploration_split_xy = [float(exp_task1[-1, 0]), float(exp_task1[-1, 1])] if exp_task1 is not None else None
+
+    # Task 2 of each recording (walk back): its samples from the marked time on.
+    def _task2(xy: pd.DataFrame, split_t_s: Optional[float]) -> Optional[np.ndarray]:
+        if split_t_s is None:
+            return None
+        part = xy[xy["t_s"] >= split_t_s]
+        return part[["x", "y"]].to_numpy() if len(part) >= 2 else None
+
+    learn_task2 = _task2(learn_xy, learning_split_t_s)
+    exp_task2 = _task2(exp_xy, exploration_split_t_s)
+    dtw_task2_distance_m = None
+    dtw_task2_match: Dict[str, Optional[float]] = {}
+    if learn_task2 is not None and exp_task2 is not None:
+        n_task2 = settings.trial_shape_resample_points
+        dtw_task2_distance_m, task2_pairs = dtw_alignment(resample_by_arclength(learn_task2, n_task2), resample_by_arclength(exp_task2, n_task2))
+        dtw_task2_match = dtw_match_pcts(task2_pairs)
+
+    overlap_pct = mean_deviation_m = None
+    shape_overlap_pct = shape_deviation_m = frechet_distance_m = dtw_distance_m = lcss_pct = None
+    shape_deviation_profile = learn_resampled_xy = exp_resampled_xy = None
+    dtw_task1_match: Dict[str, Optional[float]] = {}
+    stop_position_distance_m = None
+    if learn_task1 is not None and exp_task1 is not None:
+        l1x, l1y = learn_task1[:, 0], learn_task1[:, 1]
+        e1x, e1y = exp_task1[:, 0], exp_task1[:, 1]
+        # Overlap: fraction of exploration points that fall within the buffer distance
+        # of the learning trajectory (nearest-neighbor distance, point-wise). Vectorized
+        # pairwise distance matrix instead of a Python-level loop: with sessions running
+        # into thousands of samples, a per-point loop held the GIL long enough to stall
+        # other concurrent requests (e.g. a rapid sequence of dropdown changes).
+        min_dist = np.hypot(e1x[:, None] - l1x[None, :], e1y[:, None] - l1y[None, :]).min(axis=1)
+        overlap_pct = float(100.0 * np.mean(min_dist <= settings.trial_overlap_buffer_m))
+        mean_deviation_m = float(min_dist.mean())
+
+        # Shape overlap: same buffer threshold as above, but point-by-point at the
+        # same relative position along each route (arc-length resampled) instead
+        # of nearest-neighbor-anywhere-on-the-route — this respects order/direction,
+        # so wandering back and forth in the same general area (which can score
+        # high on overlap_pct) doesn't score high here unless it's the same shape.
+        n_pts = settings.trial_shape_resample_points
+        learn_resampled = resample_by_arclength(learn_task1, n_pts)
+        exp_resampled = resample_by_arclength(exp_task1, n_pts)
+        pointwise_dist = np.hypot(
+            exp_resampled[:, 0] - learn_resampled[:, 0], exp_resampled[:, 1] - learn_resampled[:, 1]
+        )
+        shape_overlap_pct = float(100.0 * np.mean(pointwise_dist <= settings.trial_overlap_buffer_m))
+        shape_deviation_m = float(pointwise_dist.mean())
+        frechet_distance_m = discrete_frechet_distance(learn_resampled, exp_resampled)
+        dtw_distance_m, task1_pairs = dtw_alignment(learn_resampled, exp_resampled)
+        dtw_task1_match = dtw_match_pcts(task1_pairs)
+        lcss_pct = lcss_similarity_pct(learn_resampled, exp_resampled, settings.trial_overlap_buffer_m)
+        shape_deviation_profile = pointwise_dist.tolist()
+        learn_resampled_xy = learn_resampled.tolist()
+        exp_resampled_xy = exp_resampled.tolist()
+        # Distance from the end point: the two marked points E, never the
+        # recordings' last samples (those are the end of the walk back).
+        stop_position_distance_m = float(math.hypot(learn_task1[-1, 0] - exp_task1[-1, 0], learn_task1[-1, 1] - exp_task1[-1, 1]))
 
     # Reference turn angle at each target = the geometric angle of the IDEAL
     # straight-line route start -> O_n -> O_n+1 -> O_n+2 -> stop (the path's
@@ -1596,33 +2361,43 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
         "shape_deviation_m": shape_deviation_m,
         "frechet_distance_m": frechet_distance_m,
         "dtw_distance_m": dtw_distance_m,
+        # Correspondence index: % of DTW-matched point pairs within 0.5 / 1.0 m.
+        "dtw_match_05m_pct": dtw_task1_match.get("05"),
+        "dtw_match_1m_pct": dtw_task1_match.get("1"),
+        "dtw_task2_match_05m_pct": dtw_task2_match.get("05"),
+        "dtw_task2_match_1m_pct": dtw_task2_match.get("1"),
         "lcss_pct": lcss_pct,
+        "dtw_task2_distance_m": dtw_task2_distance_m,
         # Per-point deviation (d_k from the Shape overlap definition), exposed
         # so the frontend can chart "how far apart were learning and exploration
         # at k% of the way along the route" instead of only the mean/threshold
         # summary above — shows WHERE along the route the deviation happened.
-        "shape_deviation_profile": pointwise_dist.tolist(),
+        "shape_deviation_profile": shape_deviation_profile,
         # The actual (x, y) of the two 100-point resampled routes — lets the
         # frontend highlight "point k" on the map when hovering point k on the
         # deviation profile chart, without re-implementing the resampling.
-        "learn_resampled_xy": learn_resampled.tolist(),
-        "exp_resampled_xy": exp_resampled.tolist(),
+        "learn_resampled_xy": learn_resampled_xy,
+        "exp_resampled_xy": exp_resampled_xy,
         "turns": turn_results,
         # None (not 0) when no target position could be anchored at all (e.g.
         # haptic_on_object_intes never tracked O1/O2/O3) — 0 would misleadingly
         # read as "checked, no wrong turns" rather than "couldn't check".
         "wrong_turns_count": sum(1 for t in turn_results if t["wrong_turn"]) if turn_results else None,
         "mean_turn_deviation_deg": float(np.mean(deviations)) if deviations else None,
-        # Stop position: how far the exploration's end point is from the learning
-        # trajectory's own end point (the "ideal" stop location).
-        "stop_position_distance_m": float(math.hypot(lx[-1] - ex[-1], ly[-1] - ey[-1])),
+        # Distance from the end point: marked point E of the exploration vs
+        # marked point E of the learning recording (None until both are marked).
+        "stop_position_distance_m": stop_position_distance_m,
         # Start position: how far the exploration's start point is from the
         # learning trajectory's own start point (the "ideal" start location).
         "start_position_distance_m": float(math.hypot(lx[0] - ex[0], ly[0] - ey[0])),
-        "ideal_stop_xy": [float(lx[-1]), float(ly[-1])],
+        "ideal_stop_xy": learning_split_xy,
+        "learning_split_xy": learning_split_xy,
+        "exploration_split_xy": exploration_split_xy,
+        "exploration_end_xy": [float(ex[-1]), float(ey[-1])],
+        "exploration_start_xy": [float(ex[0]), float(ey[0])],
         "ideal_start_xy": [float(lx[0]), float(ly[0])],
-        # "Returned to start": how far the exploration's END point is from the
-        # learning trajectory's START point — did they go out and come back?
+        # Return distance: the exploration's LAST position vs the learning
+        # recording's FIRST position — did they go out and come back?
         # (Reuses ideal_start_xy as the same "ideal" point for this metric too.)
         "return_to_start_distance_m": float(math.hypot(lx[0] - ex[-1], ly[0] - ey[-1])),
         # Self-referential variant: exploration's own END point vs its own START
@@ -1636,11 +2411,29 @@ def compute_trial_metrics(learning_session_id: Optional[int], exploration_sessio
     }
 
 
+@_serialized
 @lru_cache(maxsize=2048)
-def load_trial_metrics(learning_session_id: Optional[int], exploration_session_id: Optional[int]) -> Dict[str, Any]:
-    return compute_trial_metrics(learning_session_id, exploration_session_id)
+def load_trial_metrics(
+    learning_session_id: Optional[int],
+    exploration_session_id: Optional[int],
+    learning_split_t_s: Optional[float] = None,
+    exploration_split_t_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    # The marked times are part of the cache key, so marking or clearing a
+    # point E recomputes exactly the trials it touches.
+    return compute_trial_metrics(learning_session_id, exploration_session_id, learning_split_t_s, exploration_split_t_s)
 
 
+def trial_split_times(learning_session_id: Optional[int], exploration_session_id: Optional[int]) -> Tuple[Optional[float], Optional[float]]:
+    sessions_df = get_sessions_df()
+    splits = load_task_splits()
+    return tuple(  # type: ignore[return-value]
+        split_time_for_file(sessions_df.iloc[int(sid)]["file_name"], splits) if sid is not None else None
+        for sid in (learning_session_id, exploration_session_id)
+    )
+
+
+@_serialized
 @lru_cache(maxsize=2048)
 def load_exploration_movement_events(exploration_session_id: int) -> Dict[str, Any]:
     """Stop and border-crossing counts for one exploration session, cached —
@@ -1652,7 +2445,7 @@ def load_exploration_movement_events(exploration_session_id: int) -> Dict[str, A
     row = sessions_df.iloc[int(exploration_session_id)]
     data = load_json_cached(str(row["file_path"]))
     config = extract_config(data)
-    tracking_df = session_to_tracking_df(data)
+    tracking_df = load_tracking_df(row["file_path"])
     speed_df = compute_speed_df(tracking_df, seeker_id=config["seeker_id"], rolling_window=settings.speed_rolling_window)
     bbox = compute_room_bbox(config["anchors"])
     return {
@@ -1661,8 +2454,137 @@ def load_exploration_movement_events(exploration_session_id: int) -> Dict[str, A
     }
 
 
+TASK_EVENT_KEYS = (
+    "task1_min_closest_distance_m",
+    "task1_target_feedback_depth_pct", "task1_approach_depth_pct",
+    "task1_stop_count", "task1_border_reached_count", "task1_impact_count",
+    "task2_stop_count", "task2_border_reached_count", "task2_impact_count",
+)
+
+
+@_serialized
+@lru_cache(maxsize=4096)
+def load_task_event_counts(exploration_session_id: int, split_t_s: Optional[float]) -> Dict[str, Any]:
+    """Stops, border crossings and landmark impacts of one exploration
+    recording, counted separately for its two tasks. Same events as the
+    whole-recording counts; an event belongs to task 1 when it STARTS at or
+    before the marked time, so the two counts always add up to the whole.
+    All None when the recording has no marked time."""
+    if split_t_s is None:
+        return {k: None for k in TASK_EVENT_KEYS}
+    row = get_sessions_df().iloc[int(exploration_session_id)]
+    config = extract_config(load_json_cached(str(row["file_path"])))
+    tracking_df = load_tracking_df(row["file_path"])
+    speed_df = compute_speed_df(tracking_df, seeker_id=config["seeker_id"], rolling_window=settings.speed_rolling_window)
+    impacts = [
+        ev for ev in compute_imu_quality(tracking_df, config["seeker_id"], config["target_ids"]).get("events", [])
+        if ev.get("tag_id") in config["target_ids"]
+    ]
+    events = {
+        "stop_count": compute_stop_events(speed_df)["events"],
+        "border_reached_count": compute_border_events(tracking_df, config["seeker_id"], compute_room_bbox(config["anchors"]))["events"],
+        "impact_count": impacts,
+    }
+    out: Dict[str, Any] = {}
+    for name, items in events.items():
+        in_task1 = sum(1 for ev in items if ev.get("t_s") is not None and ev["t_s"] <= split_t_s)
+        out[f"task1_{name}"] = in_task1
+        out[f"task2_{name}"] = len(items) - in_task1
+    # Closest distance reached to any landmark unit during task 1.
+    dist_df = compute_distances(tracking_df, seeker_id=config["seeker_id"], target_ids=config["target_ids"])
+    out["task1_min_closest_distance_m"] = None
+    if not dist_df.empty:
+        task1_dist = pd.to_numeric(dist_df.loc[dist_df["t_s"] <= split_t_s, "distance"], errors="coerce").dropna()
+        if not task1_dist.empty:
+            out["task1_min_closest_distance_m"] = float(task1_dist.min())
+    feedback_df = session_to_feedback_df(load_json_cached(str(row["file_path"])))
+    if not feedback_df.empty:
+        feedback_df = feedback_df[feedback_df["t_s"] <= split_t_s]
+    out.update(compute_approach_depth(feedback_df, config["distance_cfg"]))
+    return out
+
+
+def compute_approach_depth(feedback_df: pd.DataFrame, distance_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """How far into the feedback zone of each landmark the seeker went, read
+    from the feedback_changed events (what the participant actually felt or
+    heard), not from the tracked positions.
+
+    The feedback changes in steps of `threshold` meters, from
+    max_activation_distance (first, weakest step) down to
+    settings.feedback_innermost_step_m (last, strongest step). For every
+    landmark that gave feedback:
+    depth = 100 * steps crossed after the first one / steps available.
+    0 = never went past the first step, 100 = reached the strongest one.
+    Landmarks that gave no feedback are left out (they are already counted by
+    "targets found").
+
+    task1_target_feedback_depth_pct: {target_id: depth}.
+    task1_approach_depth_pct: mean depth over those landmarks.
+    """
+    out = _approach_depth_summary({})
+    try:
+        d_min = float(distance_cfg.get("min_activation_distance"))
+        d_max = float(distance_cfg.get("max_activation_distance"))
+        step = float(distance_cfg.get("threshold"))
+    except (TypeError, ValueError):
+        return out
+    if step <= 0 or feedback_df is None or feedback_df.empty or "bucket" not in feedback_df:
+        return out
+    steps_available = int(round((d_max - settings.feedback_innermost_step_m) / step))
+    if steps_available < 1:
+        return out
+    # Bucket numbers count the steps from min_activation_distance outwards.
+    innermost_bucket = int(round((settings.feedback_innermost_step_m - d_min) / step)) - 1
+    outermost_bucket = innermost_bucket + steps_available
+    depths: Dict[str, float] = {}
+    for tid, g in feedback_df.groupby("target_id"):
+        buckets = pd.to_numeric(g["bucket"], errors="coerce").dropna()
+        if buckets.empty:
+            continue
+        crossed = int(np.clip(outermost_bucket - buckets.min(), 0, steps_available))
+        depths[tid] = 100.0 * crossed / steps_available
+    return _approach_depth_summary(depths)
+
+
+def _approach_depth_summary(depths: Dict[str, float]) -> Dict[str, Any]:
+    values = list(depths.values())
+    return {
+        "task1_target_feedback_depth_pct": depths,
+        "task1_approach_depth_pct": float(np.mean(values)) if values else None,
+    }
+
+
+def compute_approach_depth_from_positions(
+    task1_xy: pd.DataFrame, patch_coords: Dict[str, List[float]], distance_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Same measure and same step scale as compute_approach_depth, for
+    haptic_on_object: only P1 is tracked there and the recording carries no
+    usable feedback events or landmark positions, so the depth comes from how
+    close the seeker's own position (task1_xy) got to each patch coordinate
+    (protocol position of the route's landmarks, see PROTOCOL_LANDMARKS). A patch counts once P1 came within
+    max_activation_distance of it (where its feedback starts)."""
+    try:
+        d_max = float(distance_cfg.get("max_activation_distance"))
+        step = float(distance_cfg.get("threshold"))
+    except (TypeError, ValueError):
+        return _approach_depth_summary({})
+    steps_available = int(round((d_max - settings.feedback_innermost_step_m) / step)) if step > 0 else 0
+    if steps_available < 1 or task1_xy is None or task1_xy.empty:
+        return _approach_depth_summary({})
+    px, py = task1_xy["x"].to_numpy(), task1_xy["y"].to_numpy()
+    depths: Dict[str, float] = {}
+    for tid, xy in patch_coords.items():
+        closest = float(np.hypot(px - xy[0], py - xy[1]).min())
+        if closest > d_max:
+            continue
+        crossed = int(np.clip(np.floor((d_max - closest) / step), 0, steps_available))
+        depths[tid] = 100.0 * crossed / steps_available
+    return _approach_depth_summary(depths)
+
+
+@_serialized
 @lru_cache(maxsize=2048)
-def load_target_sensor_proximity(exploration_session_id: int) -> Dict[str, float]:
+def load_target_sensor_proximity(exploration_session_id: int, split_t_s: Optional[float] = None) -> Dict[str, float]:
     """Closest geometric distance the seeker ever got to EACH sensor-tracked
     target individually, cached — like load_exploration_movement_events and
     load_session_metrics, compute_distances' full merge over the tracking
@@ -1674,13 +2596,18 @@ def load_target_sensor_proximity(exploration_session_id: int) -> Dict[str, float
     aren't cacheable (a newly-entered one must show up immediately) — see
     compute_target_proximity, which merges this with the live manual
     fallback.
+
+    With split_t_s, only task 1 (up to the marked point E) counts, since the
+    landmarks belong to task 1.
     """
     sessions_df = get_sessions_df()
     row = sessions_df.iloc[int(exploration_session_id)]
     data = load_json_cached(str(row["file_path"]))
     config = extract_config(data)
-    tracking_df = session_to_tracking_df(data)
+    tracking_df = load_tracking_df(row["file_path"])
     dist_df = compute_distances(tracking_df, seeker_id=config["seeker_id"], target_ids=config["target_ids"])
+    if split_t_s is not None and not dist_df.empty:
+        dist_df = dist_df[dist_df["t_s"] <= split_t_s]
     result: Dict[str, float] = {}
     if not dist_df.empty:
         for tid, g in dist_df.groupby("target_id"):
@@ -1694,6 +2621,7 @@ def compute_target_proximity(
     exploration_session_id: int,
     exp_xy: Optional[pd.DataFrame] = None,
     manual_coords: Optional[Dict[str, List[float]]] = None,
+    split_t_s: Optional[float] = None,
 ) -> Dict[str, float]:
     """Closest geometric distance the seeker ever got to EACH target
     individually — one entry per target this path has a coordinate for,
@@ -1713,7 +2641,9 @@ def compute_target_proximity(
     apply_manual_target_coords, so a coordinate entered a moment ago shows up
     immediately.
     """
-    result = dict(load_target_sensor_proximity(exploration_session_id))
+    result = dict(load_target_sensor_proximity(exploration_session_id, split_t_s))
+    if split_t_s is not None and exp_xy is not None and not exp_xy.empty:
+        exp_xy = exp_xy[exp_xy["t_s"] <= split_t_s]  # task 1 only, as above
     if manual_coords and exp_xy is not None and not exp_xy.empty:
         ex, ey = exp_xy["x"].to_numpy(), exp_xy["y"].to_numpy()
         for tid, xy in manual_coords.items():
@@ -1970,10 +2900,10 @@ def compute_speed_accel_correlations() -> Dict[str, Any]:
         if annotation.get("excluded_from_stats"):
             continue
         try:
-            trial_metrics = load_trial_metrics(learning_id, exploration_id)
+            trial_metrics = load_trial_metrics(learning_id, exploration_id, *trial_split_times(learning_id, exploration_id))
             session_metrics = load_session_metrics(exploration_id)
             events = load_exploration_movement_events(exploration_id)
-            target_proximities = compute_target_proximity(exploration_id)
+            target_proximities = compute_target_proximity(exploration_id, split_t_s=trial_split_times(learning_id, exploration_id)[1])
         except Exception:
             continue
         speed = session_metrics.get("mean_speed_m_s")
@@ -2033,11 +2963,45 @@ def _condition_factors(condition: str) -> Tuple[str, str]:
 # boundary_contacts/targets_found-as-count are deliberately left out for now
 # — they're low-count data that likely violates the normality assumption
 # ANOVA relies on; a Poisson/ordinal model would suit them better.
-ANOVA_DV_SPECS: List[Tuple[str, str, Optional[str]]] = [
-    ("path_efficiency_pct", "Path efficiency (%)", "nav_metrics"),
-    ("endpoint_error_m", "Endpoint (homing) error (m)", "nav_metrics"),
-    ("target_acquisition_pct", "Target acquisition (%)", "nav_metrics"),
-    ("performance_score", "Performance score (1-5)", None),
+# (dv key, label, source, group). group = which part of the trial the
+# measure describes: task 1 (route S -> E, up to the marked point), task 2
+# (walk back E -> S, from the marked point) or the whole recording. The
+# per-task measures need the manually marked points and stay out of the test
+# for any trial where they are missing.
+ANOVA_DV_SPECS: List[Tuple[str, str, Optional[str], str]] = [
+    # path_efficiency_pct deliberately excluded: its "ideal" denominator is
+    # just the learning trajectory's own noisy recorded endpoint (see
+    # ideal_stop_xy in compute_trial_metrics), not a protocol-defined
+    # coordinate — a genuine return-to-start leg, if the task has one,
+    # isn't modeled at all. Not reliable enough for a per-condition
+    # statistical comparison until that's fixed.
+    ("endpoint_error_m", "End-point distance (m)", "nav_metrics", "task1"),
+    ("dtw_distance_m", "Trajectory distance, DTW (m)", None, "task1"),
+    ("exploration_task1_length_m", "Trajectory length (m)", None, "task1"),
+    ("exploration_task1_duration_s", "Duration (s)", None, "task1"),
+    ("exploration_task1_speed_m_s", "Walking speed (m/s)", None, "task1"),
+    ("exploration_task1_length_change_m", "Trajectory length change from learning (m)", None, "task1"),
+    ("exploration_task1_movement_intensity_m_s2", "Movement intensity (m/s²)", None, "task1"),
+    # Time stopped rather than the number of stops: a count this low is a poor
+    # fit for an ANOVA (see the note above), seconds less so.
+    ("exploration_task1_pause_duration_s", "Pause duration (s)", None, "task1"),
+    # A count with many zeros, kept for task 1 only (too few in task 2) and
+    # flagged as such on its card: read the test with caution.
+    ("exploration_task1_border_reached_count", "Border crossings (count)", None, "task1"),
+    ("exploration_task1_approach_depth_pct", "Approach depth (%)", None, "task1"),
+    ("return_to_start_distance_m", "Return distance (m)", None, "task2"),
+    ("dtw_task2_distance_m", "Trajectory distance, DTW (m)", None, "task2"),
+    ("exploration_task2_length_m", "Trajectory length (m)", None, "task2"),
+    ("exploration_task2_duration_s", "Duration (s)", None, "task2"),
+    ("exploration_task2_speed_m_s", "Walking speed (m/s)", None, "task2"),
+    ("exploration_task2_length_change_m", "Trajectory length change from learning (m)", None, "task2"),
+    ("exploration_task2_movement_intensity_m_s2", "Movement intensity (m/s²)", None, "task2"),
+    # Duration only: the task-2 pause count is too low for an ANOVA, the time
+    # stopped is of the same size as in task 1.
+    ("exploration_task2_pause_duration_s", "Pause duration (s)", None, "task2"),
+    ("exploration_task2_border_reached_count", "Border crossings (count)", None, "task2"),
+    ("target_acquisition_pct", "Landmarks reached within 1.0 m (%)", "nav_metrics", "whole"),
+    ("target_within_05m_pct", "Landmarks reached within 0.5 m (%)", None, "whole"),
 ]
 
 
@@ -2087,6 +3051,9 @@ def compute_anova_results() -> Dict[str, Any]:
         return {"dvs": []}
 
     inclusion = load_inclusion()
+    # Participants left out of the quantitative statistics for data quality
+    # (stats_exclusions.json: pilot, frozen positions); still in the dashboard.
+    stats_excluded = load_stats_exclusions()
     # Latest NON-excluded attempt per (patient, condition, path_id) — rows
     # come out of compare_trials grouped by that same key and chronologically
     # ordered within it (see build_trials_df), so the last assignment below
@@ -2094,7 +3061,7 @@ def compute_anova_results() -> Dict[str, Any]:
     # note in the docstring above.
     latest_cell: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for r in rows:
-        if inclusion.get(r["patient"], True) is False:
+        if inclusion.get(r["patient"], True) is False or r["patient"] in stats_excluded:
             continue
         if r.get("excluded_from_stats") or r.get("exploration_session_id") is None:
             continue
@@ -2103,7 +3070,7 @@ def compute_anova_results() -> Dict[str, Any]:
     all_conditions = sorted({c for _, c, _ in latest_cell.keys()})
 
     dv_results: List[Dict[str, Any]] = []
-    for dv_key, dv_label, source in ANOVA_DV_SPECS:
+    for dv_key, dv_label, source, dv_group in ANOVA_DV_SPECS:
         per_patient_condition: Dict[Tuple[str, str], List[float]] = defaultdict(list)
         for (patient, condition, _path_id), r in latest_cell.items():
             if source == "nav_metrics":
@@ -2122,7 +3089,7 @@ def compute_anova_results() -> Dict[str, Any]:
 
         if len(all_conditions) != 4 or len(complete_patients) < 4:
             dv_results.append({
-                "dv": dv_key, "label": dv_label, "n_patients": len(complete_patients),
+                "dv": dv_key, "label": dv_label, "group": dv_group, "n_patients": len(complete_patients),
                 "conditions": all_conditions, "insufficient_data": True,
             })
             continue
@@ -2137,6 +3104,63 @@ def compute_anova_results() -> Dict[str, Any]:
                 "sd": float(np.std(values, ddof=1)) if len(values) > 1 else None,
                 "n": len(values),
             }
+
+        # Reference only (not tested): the LEARNING recording's own value of the
+        # same per-task measure, for the same patients and trials.
+        learning_cell_means = None
+        if dv_key.startswith("exploration_") and dv_key[len("exploration_"):] in (*TASK_SEGMENT_KEYS, *PAUSE_METRIC_KEYS):
+            learning_key = "learning_" + dv_key[len("exploration_"):]
+            learning_values: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+            # Percent change vs learning, computed trial by trial:
+            # 100 * (exploration - learning) / learning.
+            change_values: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+            for (patient, condition, _path_id), r in latest_cell.items():
+                if r.get(dv_key) is not None and r.get(learning_key) is not None:
+                    learning_values[(patient, condition)].append(float(r[learning_key]))
+                    if float(r[learning_key]) > 0:
+                        change_values[(patient, condition)].append(100.0 * (float(r[dv_key]) - float(r[learning_key])) / float(r[learning_key]))
+            learning_cell_means = {}
+            for condition in all_conditions:
+                values = [float(np.mean(learning_values[(p, condition)])) for p in complete_patients if learning_values.get((p, condition))]
+                changes = [float(np.mean(change_values[(p, condition)])) for p in complete_patients if change_values.get((p, condition))]
+                learning_cell_means[condition] = {
+                    "mean": float(np.mean(values)) if values else None,
+                    "sd": float(np.std(values, ddof=1)) if len(values) > 1 else None,
+                    "n": len(values),
+                    "change_pct_mean": float(np.mean(changes)) if changes else None,
+                    "change_pct_sd": float(np.std(changes, ddof=1)) if len(changes) > 1 else None,
+                }
+
+        # Approach depth only: how many of the same participants, per
+        # condition, fall in each of three groups, judged on every landmark
+        # that gave them feedback in that condition — "turned" (left at least
+        # one at the first step), "partway" (never that, but stopped short of
+        # the strongest step at least once), "full" (always reached it).
+        # reach_groups, same participants: how many landmarks of their routes
+        # in that condition are not marked as found (the same "targets found"
+        # as Target acquisition: feedback or manual flag, whole recording) —
+        # "none" (all reached), "one", "more" (two or more).
+        approach_groups = None
+        reach_groups = None
+        if dv_key == "exploration_task1_approach_depth_pct":
+            landmark_depths: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+            landmarks_missed: Dict[Tuple[str, str], int] = defaultdict(int)
+            for (patient, condition, _path_id), r in latest_cell.items():
+                landmark_depths[(patient, condition)].extend((r.get("exploration_task1_target_feedback_depth_pct") or {}).values())
+                target_discovery = r.get("target_discovery")
+                if target_discovery:
+                    landmarks_missed[(patient, condition)] += len(target_discovery["targets"]) - target_discovery["found_count"]
+            approach_groups, reach_groups = {}, {}
+            for condition in all_conditions:
+                groups = {"turned": 0, "partway": 0, "full": 0}
+                reach = {"none": 0, "one": 0, "more": 0}
+                for p in complete_patients:
+                    depths = landmark_depths[(p, condition)]
+                    groups["turned" if min(depths) == 0 else "partway" if min(depths) < 100 else "full"] += 1
+                    missed = landmarks_missed[(p, condition)]
+                    reach["none" if missed == 0 else "one" if missed == 1 else "more"] += 1
+                approach_groups[condition] = groups
+                reach_groups[condition] = reach
 
         long_df = pd.DataFrame([
             {
@@ -2160,18 +3184,148 @@ def compute_anova_results() -> Dict[str, Any]:
                 }
                 for name, row in table.iterrows()
             }
+            # Counts with many zeros: also a rank-transformed two-way RM ANOVA
+            # (all participant x condition means ranked together, average
+            # ranks for ties, then the same AnovaRM), as a robustness check.
+            rank_effects = None
+            if dv_key.endswith("border_reached_count"):
+                rank_df = long_df.assign(value=long_df["value"].rank(method="average"))
+                rank_table = AnovaRM(rank_df, depvar="value", subject="patient", within=["modality", "location"]).fit().anova_table
+                rank_effects = {
+                    effect_key.get(name, name): {
+                        "F": float(row["F Value"]), "df_num": float(row["Num DF"]),
+                        "df_den": float(row["Den DF"]), "p": float(row["Pr > F"]),
+                    }
+                    for name, row in rank_table.iterrows()
+                }
             dv_results.append({
-                "dv": dv_key, "label": dv_label, "n_patients": len(complete_patients),
+                "dv": dv_key, "label": dv_label, "group": dv_group, "n_patients": len(complete_patients),
                 "conditions": all_conditions, "cell_means": cell_means, "effects": effects,
+                "rank_effects": rank_effects,
+                # One value per participant and condition (the same ones the
+                # means are computed from), for distribution plots.
+                "cell_values": {
+                    condition: [{"patient": p, "value": float(cell_value[(p, condition)])} for p in complete_patients]
+                    for condition in all_conditions
+                },
+                "learning_cell_means": learning_cell_means,
+                "approach_groups": approach_groups,
+                "reach_groups": reach_groups,
                 "insufficient_data": False,
             })
         except Exception as exc:
             dv_results.append({
-                "dv": dv_key, "label": dv_label, "n_patients": len(complete_patients),
+                "dv": dv_key, "label": dv_label, "group": dv_group, "n_patients": len(complete_patients),
                 "conditions": all_conditions, "insufficient_data": True, "error": str(exc),
             })
 
-    return {"dvs": dv_results}
+    # Participants with a valid trial in every condition (the ANOVA sample
+    # before the per-measure check), for the page-wide filter of General statistics.
+    conditions_by_patient: Dict[str, set] = defaultdict(set)
+    for patient, condition, _path_id in latest_cell:
+        conditions_by_patient[patient].add(condition)
+    complete_participants = sorted(p for p, conds in conditions_by_patient.items() if conds >= set(all_conditions))
+
+    return {
+        "dvs": dv_results,
+        "mixed_models": _fit_mixed_models(latest_cell),
+        "excluded_participants": stats_excluded,
+        "complete_participants": complete_participants,
+    }
+
+
+# The three primary measures, fitted trial by trial (see _fit_mixed_models).
+MIXED_MODEL_SPECS: List[Tuple[str, str, Optional[str], str]] = [
+    ("endpoint_error_m", "End-point distance (m)", "nav_metrics", "task1"),
+    ("dtw_distance_m", "Trajectory distance, DTW (m)", None, "task1"),
+    ("return_to_start_distance_m", "Return distance (m)", None, "task2"),
+]
+
+
+def _fit_mixed_models(latest_cell: Dict[Tuple[str, str, str], Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Linear mixed model per primary measure: value ~ modality * location,
+    with participant and route as random intercepts. Unlike the ANOVA above
+    it uses every valid trial of every included participant (no complete-case
+    requirement, the two routes of a condition are not averaged).
+
+    Factors are coded -0.5 / +0.5 (auditory / haptic, on object / on person),
+    so each main effect is the difference between its two levels averaged
+    over the other factor, in the measure's own unit. If the model with both
+    random effects cannot be estimated, it falls back to participant only and
+    says so.
+    """
+    import warnings
+    from statsmodels.regression.mixed_linear_model import MixedLM
+
+    results: List[Dict[str, Any]] = []
+    for dv_key, dv_label, source, dv_group in MIXED_MODEL_SPECS:
+        records = []
+        for (patient, condition, path_id), r in latest_cell.items():
+            value = (r.get("nav_metrics") or {}).get(dv_key) if source == "nav_metrics" else r.get(dv_key)
+            if value is None:
+                continue
+            modality, location = _condition_factors(condition)
+            records.append({
+                "value": float(value), "patient": patient, "route": r.get("route_id") or path_id, "one": 1,
+                "mod": 0.5 if modality == "haptic" else -0.5,
+                "loc": 0.5 if location == "on_person" else -0.5,
+            })
+        base = {"dv": dv_key, "label": dv_label, "group": dv_group, "n_trials": len(records)}
+        df = pd.DataFrame(records)
+        if df.empty or df["patient"].nunique() < 4:
+            results.append({**base, "n_patients": int(df["patient"].nunique()) if not df.empty else 0, "insufficient_data": True})
+            continue
+        base.update({"n_patients": int(df["patient"].nunique()), "n_routes": int(df["route"].nunique())})
+
+        attempts = [
+            ("participant + route", lambda: MixedLM.from_formula(
+                "value ~ mod * loc", df, groups="one",
+                vc_formula={"patient": "0 + C(patient)", "route": "0 + C(route)"},
+            )),
+            ("participant", lambda: MixedLM.from_formula("value ~ mod * loc", df, groups="patient")),
+        ]
+        # Small samples often leave a variance component near zero, where the
+        # default optimiser stalls: try a few before giving up on a structure.
+        fitted = None
+        unconverged = None
+        for random_effects, build in attempts:
+            for method in ("lbfgs", "bfgs", "powell", "nm"):
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        fit = build().fit(reml=True, method=[method])
+                except Exception:
+                    continue
+                if not np.all(np.isfinite(np.asarray(fit.bse_fe, dtype=float))):
+                    continue
+                if getattr(fit, "converged", True):
+                    fitted = (random_effects, fit)
+                    break
+                unconverged = unconverged or (random_effects, fit)
+            if fitted is not None:
+                break
+        fitted = fitted or unconverged
+        if fitted is None:
+            results.append({**base, "insufficient_data": True, "error": "the model could not be estimated"})
+            continue
+        random_effects, fit = fitted
+        conf = fit.conf_int()
+        names = {"mod": "modality", "loc": "location", "mod:loc": "interaction"}
+        effects = {
+            out_name: {
+                "estimate": float(fit.params[name]),
+                "ci_low": float(conf.loc[name, 0]),
+                "ci_high": float(conf.loc[name, 1]),
+                "p": float(fit.pvalues[name]),
+            }
+            for name, out_name in names.items()
+        }
+        results.append({
+            **base, "insufficient_data": False, "random_effects": random_effects,
+            "converged": bool(getattr(fit, "converged", True)),
+            "intercept": float(fit.params["Intercept"]), "effects": effects,
+        })
+    return results
 
 
 def compare_trials(
@@ -2208,24 +3362,92 @@ def compare_trials(
             "attempt_number": _jsonable(r["attempt_number"]),
             "total_attempts": _jsonable(r["total_attempts"]),
             "got_lost": bool(r["trial_got_lost"]),
+            # Route actually set up (route_overrides.json); path_id stays the
+            # file-name letter and the trial's key.
+            "route_id": (
+                actual_route(str(r["patient"]), str(r["condition"]), str(r["path_id"]))
+                if isinstance(r["path_id"], str) else _jsonable(r["path_id"])
+            ),
+            "learning_pinned": bool(r.get("learning_pinned", False)),
+            "exploration_pinned": bool(r.get("exploration_pinned", False)),
         }
         annotation = get_annotation(r["patient"], r["condition"], r["path_id"], exploration_id)
         row_out["manual_lost"] = annotation.get("manual_lost")
         row_out["comment"] = annotation.get("comment") or ""
         row_out["excluded_from_stats"] = bool(annotation.get("excluded_from_stats", False))
         try:
-            metrics = load_trial_metrics(learning_id, exploration_id)
+            learning_split_t_s, exploration_split_t_s = trial_split_times(learning_id, exploration_id)
+            row_out["learning_split_t_s"] = learning_split_t_s
+            row_out["exploration_split_t_s"] = exploration_split_t_s
+            metrics = load_trial_metrics(learning_id, exploration_id, learning_split_t_s, exploration_split_t_s)
             row_out.update({k: (v if k == "turns" else _jsonable(v)) for k, v in metrics.items()})
+
+            # Pauses (stay points, compute_stay_point_pauses) and data gaps of P1, whole and
+            # per task, for both recordings: {phase}_[task1_|task2_]pause_* /
+            # data_gap_*. The previous rule stays in the *stop* fields.
+            for prefix, sid, split_t_s in (
+                ("learning", learning_id, learning_split_t_s), ("exploration", exploration_id, exploration_split_t_s),
+            ):
+                pause_metrics = (
+                    load_pause_metrics(sid, split_t_s, settings.pause_stay_radius_m, settings.pause_min_duration_s)
+                    if sid is not None else {}
+                )
+                for key in PAUSE_METRIC_KEYS:
+                    row_out[f"{prefix}_{key}"] = pause_metrics.get(key)
+                # Border crossings (hysteresis rule) whole and per task, and the
+                # previous 0.3 s merge rule under *_merge for comparison. The
+                # exploration whole / per-task keys are filled further down
+                # from the same rule (load_exploration_movement_events,
+                # load_task_event_counts).
+                border = load_border_counts(sid, split_t_s) if sid is not None else {}
+                for key in BORDER_COUNT_KEYS:
+                    if prefix == "learning" or key.endswith("_merge"):
+                        row_out[f"{prefix}_{key}"] = border.get(key)
+                # Time and speed near / away from the landmarks, task 1 (descriptive).
+                zone = load_landmark_zone_split(sid, split_t_s) if sid is not None else {}
+                for key in LANDMARK_ZONE_KEYS:
+                    row_out[f"{prefix}_{key}"] = zone.get(key)
+            # Learning approach depth, next to the experimental one (reference only).
+            learning_depth = load_learning_approach_depth(learning_id, learning_split_t_s) if learning_id is not None else {}
+            row_out["learning_task1_approach_depth_pct"] = learning_depth.get("task1_approach_depth_pct")
+            row_out["learning_task1_target_feedback_depth_pct"] = learning_depth.get("task1_target_feedback_depth_pct")
+
+            # Whole-recording and per-task length / duration / speed of both
+            # recordings of the trial, in separate fields.
+            for prefix, sid, split_t_s in (
+                ("learning", learning_id, learning_split_t_s), ("exploration", exploration_id, exploration_split_t_s),
+            ):
+                whole = load_session_metrics(sid) if sid is not None else {}
+                row_out[f"{prefix}_length_m"] = whole.get("total_distance_m")
+                row_out[f"{prefix}_duration_s"] = whole.get("duration_s")
+                row_out[f"{prefix}_speed_m_s"] = whole.get("mean_speed_m_s")
+                row_out[f"{prefix}_movement_intensity_m_s2"] = whole.get("movement_intensity_m_s2")
+                segments = load_task_segments(sid, split_t_s) if sid is not None else {}
+                for key in TASK_SEGMENT_KEYS:
+                    row_out[f"{prefix}_{key}"] = segments.get(key)
+
+            # Change in trajectory length from the learning phase, per task:
+            # experimental minus learning length of the same trial (m). None
+            # unless both recordings have their split marked.
+            for task in ("task1", "task2"):
+                exp_len = row_out.get(f"exploration_{task}_length_m")
+                learn_len = row_out.get(f"learning_{task}_length_m")
+                row_out[f"exploration_{task}_length_change_m"] = (
+                    float(exp_len) - float(learn_len) if exp_len is not None and learn_len is not None else None
+                )
 
             if exploration_id is not None:
                 exp_row = sessions_df.iloc[exploration_id]
                 exp_data = load_json_cached(str(exp_row["file_path"]))
                 exp_config = extract_config(exp_data)
-                exp_tracking = session_to_tracking_df(exp_data)
+                exp_tracking = load_tracking_df(exp_row["file_path"])
 
                 movement_events = load_exploration_movement_events(exploration_id)
                 row_out["stop_count"] = movement_events["stop_count"]
                 row_out["border_reached_count"] = movement_events["border_reached_count"]
+
+                for key, value in load_task_event_counts(exploration_id, exploration_split_t_s).items():
+                    row_out[f"exploration_{key}"] = value
 
                 session_metrics = load_session_metrics(exploration_id)
                 row_out["mean_speed_m_s"] = session_metrics.get("mean_speed_m_s")
@@ -2240,7 +3462,23 @@ def compare_trials(
                 exp_xy = None
                 if manual_coords and row_out.get("target_discovery") is not None:
                     exp_xy = p1_xy(exp_tracking, exp_config["seeker_id"])
-                    row_out["target_discovery"] = apply_manual_target_coords(row_out["target_discovery"], exp_xy, manual_coords)
+                    # Landmarks belong to task 1: the "within 1 m of the patch" rule too.
+                    task1_only = exp_xy[exp_xy["t_s"] <= exploration_split_t_s] if exploration_split_t_s is not None else exp_xy
+                    row_out["target_discovery"] = apply_manual_target_coords(row_out["target_discovery"], task1_only, manual_coords)
+
+                # haptic_on_object tracks P1 only: whatever feedback events or
+                # O1-O3 positions its recording still carries are leftovers,
+                # so its approach depth is redone from P1's position against
+                # the protocol position of the route's landmarks (a manually
+                # entered coordinate, when there is one, replaces it).
+                if _condition_factors(r["condition"]) == ("haptic", "on_object") and exploration_split_t_s is not None:
+                    task1_xy = exp_xy if exp_xy is not None else p1_xy(exp_tracking, exp_config["seeker_id"])
+                    patch_coords = {**protocol_landmark_coordinates(row_out["route_id"], exp_config["target_ids"]), **manual_coords}
+                    depth = compute_approach_depth_from_positions(
+                        task1_xy[task1_xy["t_s"] <= exploration_split_t_s], patch_coords, exp_config["distance_cfg"],
+                    )
+                    for key, value in depth.items():
+                        row_out[f"exploration_{key}"] = value
 
                 # Manual found/in-order flags (same "not cached" reasoning as
                 # the coordinates above) — always win over whatever the
@@ -2248,6 +3486,38 @@ def compare_trials(
                 manual_discovery_override = get_manual_discovery_override(r["patient"], r["condition"], r["path_id"])
                 if row_out.get("target_discovery") is not None:
                     row_out["target_discovery"] = apply_manual_discovery_overrides(row_out["target_discovery"], manual_discovery_override)
+
+                # Share (%) of the route's landmarks reached within 0.5 m in task 1
+                # (up to the marked split). AP/AE/HP: closest P1 distance to each
+                # unit (load_target_sensor_proximity). HE: a manual found flag is
+                # kept (found = reached the 50 cm patch); without a flag, P1 within
+                # 0.5 m of the protocol patch position. None without a split or
+                # without a distance for every landmark.
+                row_out["target_within_05m_pct"] = None
+                if exploration_split_t_s is not None and row_out.get("target_discovery") is not None:
+                    radius = 0.5
+                    targets = row_out["target_discovery"]["targets"]
+                    reached: List[bool] = []
+                    if _condition_factors(r["condition"]) == ("haptic", "on_object"):
+                        exp_xy_all = exp_xy if exp_xy is not None else p1_xy(exp_tracking, exp_config["seeker_id"])
+                        task1_xy = exp_xy_all[exp_xy_all["t_s"] <= exploration_split_t_s]
+                        patches = protocol_landmark_coordinates(row_out["route_id"], exp_config["target_ids"])
+                        for t in targets:
+                            flag = t.get("manual_found_override")
+                            if flag is not None:
+                                reached.append(bool(flag))
+                            elif t["target_id"] in patches and not task1_xy.empty:
+                                px, py = patches[t["target_id"]]
+                                reached.append(bool(np.hypot(task1_xy["x"] - px, task1_xy["y"] - py).min() <= radius))
+                            else:
+                                reached = []
+                                break
+                    else:
+                        closest = load_target_sensor_proximity(exploration_id, exploration_split_t_s)
+                        if all(t["target_id"] in closest for t in targets):
+                            reached = [closest[t["target_id"]] <= radius for t in targets]
+                    if reached and len(reached) == len(targets):
+                        row_out["target_within_05m_pct"] = 100.0 * sum(reached) / len(reached)
 
                 # A trial flagged "excluded from statistics" (hardware error /
                 # bad trial — see the Exclude from statistics checkbox) has no
@@ -2260,7 +3530,7 @@ def compare_trials(
                 else:
                     target_discovery = row_out.get("target_discovery")
                     target_proximities = compute_target_proximity(
-                        exploration_id, exp_xy=exp_xy, manual_coords=manual_coords,
+                        exploration_id, exp_xy=exp_xy, manual_coords=manual_coords, split_t_s=exploration_split_t_s,
                     )
                     target_found = {t["target_id"]: t["found"] for t in target_discovery["targets"]} if target_discovery else {}
                     found_count = target_discovery.get("found_count") if target_discovery else None
@@ -2295,6 +3565,16 @@ def compare_trials(
                 row_out["performance_score"] = None
                 row_out["performance_score_details"] = None
                 row_out["nav_metrics"] = None
+            # Per-landmark approach depth counts, task 1, both phases: landmarks
+            # left at the first step (0%), reached to the strongest step (100%),
+            # and all landmarks that gave feedback (the denominator; for
+            # haptic_on_object, those within reach of the protocol position).
+            for prefix in ("learning", "exploration"):
+                depths = row_out.get(f"{prefix}_task1_target_feedback_depth_pct")
+                values = list(depths.values()) if isinstance(depths, dict) else None
+                row_out[f"{prefix}_task1_landmarks_depth0_count"] = None if values is None else sum(1 for v in values if v == 0)
+                row_out[f"{prefix}_task1_landmarks_depth100_count"] = None if values is None else sum(1 for v in values if v == 100)
+                row_out[f"{prefix}_task1_landmarks_with_feedback_count"] = None if values is None else len(values)
         except Exception as exc:
             row_out["error"] = str(exc)
         results.append(row_out)

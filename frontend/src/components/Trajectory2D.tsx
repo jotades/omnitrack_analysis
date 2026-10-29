@@ -380,12 +380,12 @@ export function Trajectory2D({
   });
 
   const legendItems = [
-    ...(seekerFull.length ? [{ name: `${seeker} full path (hover to scrub)`, color: '#98a2b3', dashed: true }] : []),
+    ...(seekerFull.length ? [{ name: `${seeker} full trajectory (hover to scrub)`, color: '#98a2b3', dashed: true }] : []),
     ...groupedPlot.map(({ tag }, idx) => ({ name: tag, color: palette[idx % palette.length] })),
     ...(cooked.length ? [{ name: `${seeker} cooked α=0.4`, color: '#777' }] : []),
     ...phaseOverlays.map((item) => ({ name: `${item.phase} ${seeker}`, color: item.color, dashed: true })),
     ...(borderBoxDisplay ? [{ name: 'border 8×6 m', color: BORDER_COLOR, dashed: true }] : []),
-    ...(idealPathDisplay.length ? [{ name: 'ideal path (start→O→O→O→stop)', color: IDEAL_PATH_COLOR, dashed: true }] : []),
+    ...(idealPathDisplay.length ? [{ name: 'ideal route (start→O→O→O→stop)', color: IDEAL_PATH_COLOR, dashed: true }] : []),
   ];
 
   const pointsOutOfRoom = payload.tracking.filter((p) => {
@@ -401,7 +401,7 @@ export function Trajectory2D({
   return (
     <ChartCard
       title="2D room trajectory"
-      subtitle={`Proportional room ${roomX} m × ${roomY} m, ${rotate90 ? 'rotated 90°' : 'original'} view. Move the mouse along the path to scrub every chart, no Play needed.`}
+      subtitle={`Proportional room ${roomX} m × ${roomY} m, ${rotate90 ? 'rotated 90°' : 'original'} view. Move the mouse along the trajectory to scrub every chart, no Play needed.`}
       className="span2"
     >
       {!groupedPlot.length ? (
@@ -513,7 +513,7 @@ export function Trajectory2D({
 
                   {idealPathDisplay.length ? (
                     <Scatter
-                      name="ideal path"
+                      name="ideal route"
                       data={idealPathDisplay}
                       line={{ stroke: IDEAL_PATH_COLOR, strokeWidth: 2.2, strokeDasharray: '7 5' }}
                       lineType="joint"
@@ -538,7 +538,7 @@ export function Trajectory2D({
 
                   {seekerFull.length ? (
                     <Scatter
-                      name={`${seeker} full path`}
+                      name={`${seeker} full route`}
                       data={seekerFull}
                       line={{ stroke: '#98a2b3', strokeOpacity: 0.35, strokeWidth: 1.5, strokeDasharray: '4 3' }}
                       lineType="joint"
@@ -648,7 +648,7 @@ export function Trajectory2D({
           </ChartFrame>
           <CustomLegend items={legendItems} />
           {(showLearning || showExploration) && !phaseOverlays.length ? (
-            <div className="miniWarning">Looking for learning/exploration sessions with the same patient, condition and path. If nothing shows up, one of the two sessions is missing or has no valid P1 points.</div>
+            <div className="miniWarning">Looking for learning/exploration sessions with the same participant, condition and route. If nothing shows up, one of the two sessions is missing or has no valid P1 points.</div>
           ) : null}
         </>
       )}

@@ -192,8 +192,9 @@ export async function saveTargetCoordinate(payload: {
   condition: string;
   pathId: string;
   targetId: string;
-  x: number;
-  y: number;
+  /** null for both removes the coordinate entered for that target. */
+  x: number | null;
+  y: number | null;
 }): Promise<Record<string, [number, number]>> {
   const res = await fetch(`${API_BASE}/api/target-coordinates`, {
     method: 'POST',
@@ -211,6 +212,32 @@ export async function saveTargetCoordinate(payload: {
   const data = await res.json();
   invalidateDerivedCaches(payload.patient); // a moved target changes proximity/found/path-efficiency downstream
   return data.coordinates;
+}
+
+export interface TaskSplit { t_s: number; x: number | null; y: number | null }
+
+/** {file_name: {t_s, x, y}} — the manually marked point E of a recording:
+ * where the route to the end point finishes and the walk back begins. */
+export async function fetchTaskSplits(): Promise<Record<string, TaskSplit>> {
+  const data = await getJson<{ splits: Record<string, TaskSplit> }>('/api/task-split');
+  return data.splits;
+}
+
+/** tS = null clears the mark for that recording. */
+export async function saveTaskSplit(payload: {
+  fileName: string;
+  tS: number | null;
+  x?: number | null;
+  y?: number | null;
+}): Promise<Record<string, TaskSplit>> {
+  const res = await fetch(`${API_BASE}/api/task-split`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file_name: payload.fileName, t_s: payload.tS, x: payload.x ?? null, y: payload.y ?? null }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.splits;
 }
 
 /** {`${patient}|${condition}|${path_id}`: {targets_found: {target_id: bool}, in_order: bool | null}}
@@ -336,4 +363,50 @@ export async function fetchBarChartPng(payload: {
   });
   if (!res.ok) throw new Error(await res.text());
   return res.blob();
+}
+
+/** {section_key: text} — free-text observations written next to a block of results. */
+export async function fetchObservations(): Promise<Record<string, string>> {
+  const data = await getJson<{ observations: Record<string, string> }>('/api/observations');
+  return data.observations;
+}
+
+export async function saveObservation(key: string, text: string): Promise<Record<string, string>> {
+  const res = await fetch(`${API_BASE}/api/observations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, text }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.observations;
+}
+
+/** Participants left out of the ANOVA and the mixed models: {patient: reason}. */
+export async function fetchStatsExclusions(): Promise<Record<string, string>> {
+  const data = await getJson<{ excluded: Record<string, string> }>('/api/stats-exclusions');
+  return data.excluded ?? {};
+}
+
+export interface ChangeEntry {
+  id: string;
+  time: string;
+  kind: string;
+  summary: string;
+  undo_of?: string;
+  undone_by?: string;
+}
+
+/** Corrections saved from the dashboard, newest first. */
+export async function fetchChanges(limit = 50): Promise<ChangeEntry[]> {
+  const data = await getJson<{ changes: ChangeEntry[] }>(`/api/changes?limit=${limit}`);
+  return data.changes ?? [];
+}
+
+export async function undoChange(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/changes/${id}/undo`, { method: 'POST' });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error(detail?.detail ?? `Undo failed (${res.status})`);
+  }
 }

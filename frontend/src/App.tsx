@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BarChart3, Footprints, Moon, RefreshCw, Sun, User } from 'lucide-react';
+import { BarChart3, Footprints, Lock, LockOpen, Moon, RefreshCw, Sun, User } from 'lucide-react';
 import {
   fetchCompareRows,
   fetchPatientInclusion,
   fetchSessionDetail,
   fetchSessions,
+  fetchStatsExclusions,
+  fetchTaskSplits,
   fetchTrialRows,
   fetchTrialsSummary,
   onDerivedCachesInvalidated,
@@ -29,6 +31,8 @@ import {
 import { TrialsPanel } from './components/TrialsPanel';
 import { GeneralStatisticsPanel } from './components/GeneralStatisticsPanel';
 import { ProfilesTable, SessionStatusTable } from './components/SessionTables';
+import { ChangesMenu } from './components/ChangesMenu';
+import { EditModeContext } from './lib/editMode';
 import './styles.css';
 
 export type AnalysisMode = 'single' | 'trials' | 'general';
@@ -83,7 +87,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   const [theme, setTheme] = useState<Theme>(initialTheme);
-  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('single');
+  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('general');
+  // Off at every load: corrections can only be saved after turning it on.
+  const [editMode, setEditMode] = useState(false);
 
   const [selectedPatient, setSelectedPatient] = useState('');
   const [selectedCondition, setSelectedCondition] = useState('');
@@ -128,12 +134,28 @@ export default function App() {
     try {
       const rows = await fetchSessions();
       setSessions(rows);
+      // First load: open a recording that can show every measure — the first
+      // exploration recording of a participant used in the statistics, valid,
+      // with point E marked — instead of simply the first file in the list.
+      let start: SessionRow | undefined;
+      if (!selectedPatient) {
+        const [splits, excluded] = await Promise.all([
+          fetchTaskSplits().catch(() => ({} as Record<string, unknown>)),
+          fetchStatsExclusions().catch(() => ({} as Record<string, string>)),
+        ]);
+        start = rows.find((s) => s.phase === 'exploration' && !s.is_interrupt && !s.is_suspicious_short
+          && !(s.patient in excluded) && s.file_name in splits);
+      }
       const patients = uniq(rows.map((s) => s.patient));
-      const patient = selectedPatient || firstOrEmpty(patients);
+      const patient = selectedPatient || start?.patient || firstOrEmpty(patients);
       const conditions = uniq(rows.filter((s) => !patient || s.patient === patient).map((s) => s.condition));
-      const condition = selectedCondition || firstOrEmpty(conditions);
+      const condition = selectedCondition || start?.condition || firstOrEmpty(conditions);
       setSelectedPatient(patient);
       setSelectedCondition(condition);
+      if (start) {
+        setSelectedPhase(start.phase);
+        setSelectedPath(start.path_id);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -224,25 +246,42 @@ export default function App() {
   const trialRowsInFlight = useRef<Set<string>>(new Set());
   const [trialRowsLoadingPatients, setTrialRowsLoadingPatients] = useState<Set<string>>(new Set());
 
-  const ensureTrialRows = useCallback((patientsToLoad: string[]) => {
-    const missing = patientsToLoad.filter((p) => !(p in trialRowsCacheRef.current) && !trialRowsInFlight.current.has(p));
-    if (!missing.length) return;
-    missing.forEach((p) => trialRowsInFlight.current.add(p));
-    setTrialRowsLoadingPatients((prev) => new Set([...prev, ...missing]));
-    fetchTrialRows({ patients: missing, includeSuspicious: true })
+  const fetchAndCachePatients = useCallback((patientsToLoad: string[]) => {
+    const toLoad = patientsToLoad.filter((p) => !trialRowsInFlight.current.has(p));
+    if (!toLoad.length) return;
+    toLoad.forEach((p) => trialRowsInFlight.current.add(p));
+    setTrialRowsLoadingPatients((prev) => new Set([...prev, ...toLoad]));
+    fetchTrialRows({ patients: toLoad, includeSuspicious: true })
       .then((rows) => {
-        for (const p of missing) trialRowsCacheRef.current[p] = rows.filter((r) => r.patient === p);
+        for (const p of toLoad) trialRowsCacheRef.current[p] = rows.filter((r) => r.patient === p);
       })
       .catch(() => {
         // Mark as attempted (empty) so a persistent error doesn't retry forever on re-render.
-        for (const p of missing) trialRowsCacheRef.current[p] = trialRowsCacheRef.current[p] ?? [];
+        for (const p of toLoad) trialRowsCacheRef.current[p] = trialRowsCacheRef.current[p] ?? [];
       })
       .finally(() => {
-        missing.forEach((p) => trialRowsInFlight.current.delete(p));
-        setTrialRowsLoadingPatients((prev) => { const next = new Set(prev); missing.forEach((p) => next.delete(p)); return next; });
+        toLoad.forEach((p) => trialRowsInFlight.current.delete(p));
+        setTrialRowsLoadingPatients((prev) => { const next = new Set(prev); toLoad.forEach((p) => next.delete(p)); return next; });
         setTrialRowsVersion((v) => v + 1);
       });
   }, []);
+
+  const ensureTrialRows = useCallback((patientsToLoad: string[]) => {
+    fetchAndCachePatients(patientsToLoad.filter((p) => !(p in trialRowsCacheRef.current) && !trialRowsInFlight.current.has(p)));
+  }, [fetchAndCachePatients]);
+
+  /** Manual per-patient "Refresh" button in Trial metrics — re-fetches this
+   * ONE patient's trial rows from the backend as it currently stands
+   * (picks up annotation/coordinate/override edits immediately, same as
+   * every other trigger of fetchAndCachePatients) even though a cached
+   * copy already exists, without touching any other patient or requiring
+   * the app-wide "Refresh index" button. Does NOT re-scan DATA_DIR for new
+   * raw session files on its own — that still needs "Refresh index". */
+  const refreshPatientTrialRows = useCallback((patient: string) => {
+    if (trialRowsInFlight.current.has(patient)) return;
+    delete trialRowsCacheRef.current[patient];
+    fetchAndCachePatients([patient]);
+  }, [fetchAndCachePatients]);
 
   // A save elsewhere (target coordinate, manual found/in-order override,
   // annotation, patient inclusion) can change this ONE patient's trial
@@ -559,6 +598,7 @@ export default function App() {
   const controlledTime = globalPlayback ? playbackTime : null;
 
   return (
+    <EditModeContext.Provider value={editMode}>
     <main className="appShell">
       <header className="hero">
         <div>
@@ -569,6 +609,19 @@ export default function App() {
           </p>
         </div>
         <div className="heroSide">
+          <button
+            type="button"
+            className={editMode ? 'themeToggle editModeOn' : 'themeToggle'}
+            onClick={() => setEditMode((v) => !v)}
+            aria-pressed={editMode}
+            title={editMode
+              ? 'Edit mode is on: corrections (point E, exclusions, phase swaps, landmark flags) are saved and logged. Click to lock.'
+              : 'Read only: corrections cannot be changed. Click to turn on edit mode.'}
+          >
+            {editMode ? <LockOpen size={17} /> : <Lock size={17} />}
+            {editMode ? 'Editing on' : 'Read only'}
+          </button>
+          <ChangesMenu onUndone={() => window.location.reload()} />
           <button
             type="button"
             className="themeToggle"
@@ -601,14 +654,14 @@ export default function App() {
         <button
           type="button"
           role="tab"
-          aria-selected={analysisMode === 'single'}
-          className={analysisMode === 'single' ? 'active' : ''}
-          onClick={() => setAnalysisMode('single')}
+          aria-selected={analysisMode === 'general'}
+          className={analysisMode === 'general' ? 'active' : ''}
+          onClick={() => setAnalysisMode('general')}
         >
-          <User size={16} />
+          <BarChart3 size={16} />
           <span>
-            <strong>Single session analysis</strong>
-            <small>One patient, one session: trajectory, playback and detailed charts</small>
+            <strong>General statistics</strong>
+            <small>Totals, ANOVA and mixed model across the participants</small>
           </span>
         </button>
         <button
@@ -621,20 +674,20 @@ export default function App() {
           <Footprints size={16} />
           <span>
             <strong>Trial metrics</strong>
-            <small>Exploration vs. learning: overlap, turns, stops, border, lost trials</small>
+            <small>Exploration vs. learning: overlap, turns, pauses, border, lost trials</small>
           </span>
         </button>
         <button
           type="button"
           role="tab"
-          aria-selected={analysisMode === 'general'}
-          className={analysisMode === 'general' ? 'active' : ''}
-          onClick={() => setAnalysisMode('general')}
+          aria-selected={analysisMode === 'single'}
+          className={analysisMode === 'single' ? 'active' : ''}
+          onClick={() => setAnalysisMode('single')}
         >
-          <BarChart3 size={16} />
+          <User size={16} />
           <span>
-            <strong>General statistics</strong>
-            <small>Combined totals across every included patient</small>
+            <strong>Single session analysis</strong>
+            <small>One participant, one recording: trajectory, playback and detailed charts</small>
           </span>
         </button>
       </div>
@@ -676,6 +729,7 @@ export default function App() {
           patientSummaries={patientSummaries}
           loadingPatients={trialRowsLoadingPatients}
           onRequestTrialRows={ensureTrialRows}
+          onRefreshPatientTrialRows={refreshPatientTrialRows}
           onRefreshPatientSummaries={refreshPatientSummaries}
           inclusion={inclusion}
           onSetInclusion={setInclusion}
@@ -769,5 +823,6 @@ export default function App() {
         </>
       ) : null}
     </main>
+    </EditModeContext.Provider>
   );
 }

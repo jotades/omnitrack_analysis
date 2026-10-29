@@ -7,6 +7,8 @@ export interface SessionRow {
   condition_label: string;
   phase: string;
   path_id: string;
+  /** Route actually set up (route_overrides.json); path_id is the file-name letter. */
+  route_id?: string | null;
   start_time: string | null;
   total_samples: number | null;
   n_raw: number | null;
@@ -224,10 +226,16 @@ export interface TrialRow {
   condition: string;
   condition_label: string;
   path_id: string;
+  /** Route actually set up (route_overrides.json); path_id is the file-name letter and stays the trial's key. */
+  route_id?: string;
   learning_session_id: number | null;
   exploration_session_id: number | null;
   attempt_number: number | null;
   total_attempts: number | null;
+  /** The learning / exploration recording of this row was fixed by hand
+   * (recording_pins.json) instead of being picked automatically. */
+  learning_pinned?: boolean;
+  exploration_pinned?: boolean;
   got_lost: boolean;
   overlap_pct: number | null;
   mean_deviation_m: number | null;
@@ -284,7 +292,105 @@ export interface TrialRow {
    * learning/exploration placement drift, but requires filtering out
    * near-empty recordings separately since start==end trivially there). */
   self_return_distance_m: number | null;
+  /** Manually marked time (s) separating the two tasks of each recording of
+   * the trial — null when that recording has not been marked yet. */
+  learning_split_t_s: number | null;
+  exploration_split_t_s: number | null;
+  learning_split_xy: [number, number] | null;
+  exploration_split_xy: [number, number] | null;
+  /** Last tracked position of the exploration recording (end of the walk back). */
+  exploration_end_xy: [number, number] | null;
+  exploration_start_xy: [number, number] | null;
+  /** DTW between the two walks back (task 2 of each recording), cut at the marked points. */
+  dtw_task2_distance_m: number | null;
+  /** Correspondence index: % of the DTW-matched point pairs within 0.5 m / 1.0 m
+   * of each other, task 1 (dtw_match_*) and task 2 (dtw_task2_match_*). */
+  dtw_match_05m_pct?: number | null;
+  dtw_match_1m_pct?: number | null;
+  dtw_task2_match_05m_pct?: number | null;
+  dtw_task2_match_1m_pct?: number | null;
+  /** Closest distance reached to any landmark unit during task 1 of the exploration recording. */
+  exploration_task1_min_closest_distance_m?: number | null;
+  /** Depth (0-100%) reached into each landmark's feedback steps during task 1 (target_id -> %). */
+  exploration_task1_target_feedback_depth_pct?: Record<string, number> | null;
+  /** Mean of those depths over the landmarks that gave feedback. */
+  exploration_task1_approach_depth_pct?: number | null;
+  /** Stops, border crossings and landmark impacts of the exploration recording, per task. */
+  exploration_task1_stop_count?: number | null;
+  exploration_task1_border_reached_count?: number | null;
+  exploration_task1_impact_count?: number | null;
+  exploration_task2_stop_count?: number | null;
+  exploration_task2_border_reached_count?: number | null;
+  exploration_task2_impact_count?: number | null;
+  /** Whole-recording and per-task (task1 = start to marked point, task2 =
+   * marked point to end) length / duration / speed of both recordings. */
+  learning_length_m: number | null;
+  learning_duration_s: number | null;
+  learning_speed_m_s: number | null;
+  learning_task1_length_m: number | null;
+  learning_task1_duration_s: number | null;
+  learning_task1_speed_m_s: number | null;
+  learning_task2_length_m: number | null;
+  learning_task2_duration_s: number | null;
+  learning_task2_speed_m_s: number | null;
+  exploration_length_m: number | null;
+  exploration_duration_s: number | null;
+  exploration_speed_m_s: number | null;
+  exploration_task1_length_m: number | null;
+  exploration_task1_duration_s: number | null;
+  exploration_task1_speed_m_s: number | null;
+  exploration_task2_length_m: number | null;
+  /** Experimental minus learning trajectory length of the same trial, per task (m). */
+  exploration_task1_length_change_m?: number | null;
+  exploration_task2_length_change_m?: number | null;
+  exploration_task2_duration_s: number | null;
+  exploration_task2_speed_m_s: number | null;
+  /** Movement intensity (m/s²): mean of the norm of the hand-held unit's
+   * linear acceleration, samples at zero left out. Whole recording and per task. */
+  learning_movement_intensity_m_s2?: number | null;
+  learning_task1_movement_intensity_m_s2?: number | null;
+  learning_task2_movement_intensity_m_s2?: number | null;
+  exploration_movement_intensity_m_s2?: number | null;
+  exploration_task1_movement_intensity_m_s2?: number | null;
+  exploration_task2_movement_intensity_m_s2?: number | null;
+  /** Pauses of P1 (window speed below the noise threshold for 1 s or more)
+   * and data gaps (position frozen for 1 s or more), whole recording and per
+   * task, for both recordings — the rule the dashboard uses. */
+  learning_pause_count?: number | null;
+  learning_pause_duration_s?: number | null;
+  learning_data_gap_count?: number | null;
+  learning_data_gap_duration_s?: number | null;
+  learning_task1_pause_count?: number | null;
+  learning_task1_pause_duration_s?: number | null;
+  learning_task1_data_gap_count?: number | null;
+  learning_task1_data_gap_duration_s?: number | null;
+  learning_task2_pause_count?: number | null;
+  learning_task2_pause_duration_s?: number | null;
+  learning_task2_data_gap_count?: number | null;
+  learning_task2_data_gap_duration_s?: number | null;
+  exploration_pause_count?: number | null;
+  exploration_pause_duration_s?: number | null;
+  exploration_data_gap_count?: number | null;
+  exploration_data_gap_duration_s?: number | null;
+  exploration_task1_pause_count?: number | null;
+  exploration_task1_pause_duration_s?: number | null;
+  exploration_task1_data_gap_count?: number | null;
+  exploration_task1_data_gap_duration_s?: number | null;
+  exploration_task2_pause_count?: number | null;
+  exploration_task2_pause_duration_s?: number | null;
+  exploration_task2_data_gap_count?: number | null;
+  exploration_task2_data_gap_duration_s?: number | null;
+  /** Previous stop rule (fixed 0.08 m/s), kept for comparison. */
+  /** Stops per task: how many start in the task, and the time spent stopped in it (s). */
+  learning_task1_stop_count?: number | null;
+  learning_task2_stop_count?: number | null;
+  learning_task1_stop_duration_s?: number | null;
+  learning_task2_stop_duration_s?: number | null;
+  exploration_task1_stop_duration_s?: number | null;
+  exploration_task2_stop_duration_s?: number | null;
   target_discovery: TargetDiscovery | null;
+  /** Share (%) of the route's landmarks reached within 0.5 m in task 1. */
+  target_within_05m_pct?: number | null;
   /** target_id -> probable physical impact count during this exploration attempt. */
   target_impacts: Record<string, number>;
   stop_count: number | null;
@@ -427,11 +533,28 @@ export interface AnovaCellMean {
 export interface AnovaDvResult {
   dv: string;
   label: string;
+  /** Part of the trial the measure describes. */
+  group?: 'task1' | 'task2' | 'whole';
   n_patients: number;
   conditions: string[];
   insufficient_data: boolean;
   error?: string;
   cell_means?: Record<string, AnovaCellMean>;
+  /** One value per participant and condition, the ones behind cell_means. */
+  cell_values?: Record<string, Array<{ patient: string; value: number }>>;
+  /** Learning recording's value of the same per-task measure (reference, not tested). */
+  learning_cell_means?: Record<string, { mean: number | null; sd: number | null; n: number; change_pct_mean?: number | null; change_pct_sd?: number | null }> | null;
+  /** Approach depth only: participants per condition who left a landmark at
+   * the first feedback step at least once (turned), never did but stopped
+   * short of the strongest step at least once (partway), or always reached
+   * it (full). */
+  approach_groups?: Record<string, { turned: number; partway: number; full: number }> | null;
+  /** Approach depth only: participants per condition by how many landmarks
+   * of their routes are not marked as found (none, one, two or more). */
+  reach_groups?: Record<string, { none: number; one: number; more: number }> | null;
+  /** Border-crossing dvs only: the same two-way RM ANOVA on the ranks of the
+   * participant x condition means (robustness check for counts with many zeros). */
+  rank_effects?: { modality: AnovaEffect; location: AnovaEffect; interaction: AnovaEffect } | null;
   effects?: {
     modality: AnovaEffect;
     location: AnovaEffect;
@@ -439,8 +562,41 @@ export interface AnovaDvResult {
   };
 }
 
+export interface MixedModelEffect {
+  estimate: number;
+  ci_low: number;
+  ci_high: number;
+  p: number;
+}
+
+/** Linear mixed model on one primary measure, fitted on single trials
+ * (participant and route as random effects) — see _fit_mixed_models. */
+export interface MixedModelResult {
+  dv: string;
+  label: string;
+  group: 'task1' | 'task2' | 'whole';
+  n_trials: number;
+  n_patients: number;
+  n_routes?: number;
+  insufficient_data: boolean;
+  error?: string;
+  random_effects?: string;
+  converged?: boolean;
+  intercept?: number;
+  effects?: {
+    modality: MixedModelEffect;
+    location: MixedModelEffect;
+    interaction: MixedModelEffect;
+  };
+}
+
 export interface AnovaResults {
   dvs: AnovaDvResult[];
+  mixed_models?: MixedModelResult[];
+  /** Participants left out of the ANOVA and mixed models for data quality: {patient: reason}. */
+  excluded_participants?: Record<string, string>;
+  /** Participants with a valid trial in every condition, after the exclusions above (the ANOVA sample). */
+  complete_participants?: string[];
 }
 
 export interface PatientTrialSummary {

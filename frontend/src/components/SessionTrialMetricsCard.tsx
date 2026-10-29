@@ -35,7 +35,11 @@ export function SessionTrialMetricsCard({ payload, phaseOverlayPayloads, trialRo
     learning: !!payloadForPhase('learning', payload, phaseOverlayPayloads),
     exploration: !!payloadForPhase('exploration', payload, phaseOverlayPayloads),
   };
-  const preferredPhase: Phase | null = availability.exploration ? 'exploration' : availability.learning ? 'learning' : currentPhase;
+  // Same phase as the recording selected above (Session setup), so the two
+  // cards never show different phases; the toggle can still switch.
+  const preferredPhase: Phase | null = currentPhase && availability[currentPhase]
+    ? currentPhase
+    : availability.exploration ? 'exploration' : availability.learning ? 'learning' : currentPhase;
 
   const [manualPhase, setManualPhase] = useState<Phase | null>(null);
   useEffect(() => { setManualPhase(null); }, [payload.summary?.file]);
@@ -48,7 +52,7 @@ export function SessionTrialMetricsCard({ payload, phaseOverlayPayloads, trialRo
   const trialRow = effectivePhase ? matchTrialRow(trialRows, effectivePhase, effectiveSessionId) : null;
 
   return (
-    <ChartCard title="Session & trial metrics" subtitle={effectivePhase ? `Showing ${effectivePhase}` : undefined}>
+    <ChartCard title="Session & trial metrics" subtitle={effectivePhase ? `Showing the ${effectivePhase} phase${effectivePhase !== currentPhase ? ' (the recording selected above is the ' + currentPhase + ' phase)' : ''}` : undefined}>
       <PhaseToggle selected={effectivePhase} available={availability} onSelect={setManualPhase} />
       <TrialMiniStats row={trialRow} metrics={effectivePayload.metrics} />
     </ChartCard>

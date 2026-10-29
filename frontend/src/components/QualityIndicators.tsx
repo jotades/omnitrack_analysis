@@ -25,8 +25,8 @@ export function QualityIndicators({ payload }: { payload: SessionPayload }) {
     .map((e) => `${e.tag_id} at ${fmtSeconds(e.t_s)} (peak ${e.peak_accel.toFixed(1)})`)
     .join(', ');
   const impactTitle = hasImpacts
-    ? `Sudden acceleration on stationary target sensors — likely hit or kicked: ${impactSummary}.`
-    : 'Acceleration on target sensors O1–O3 stayed near baseline for the whole session.';
+    ? `Sudden acceleration on stationary landmark sensors — likely hit or kicked: ${impactSummary}.`
+    : 'Acceleration on landmark sensors O1–O3 stayed near baseline for the whole session.';
 
   const consistency = orientation?.consistency ?? 'unknown';
   const orientationTone = consistency === 'good' ? 'ok' : consistency === 'fair' ? 'warn' : consistency === 'poor' ? 'bad' : 'muted';
@@ -38,7 +38,7 @@ export function QualityIndicators({ payload }: { payload: SessionPayload }) {
     <div className="qualityRow">
       <div className={`qualityPill ${hasImpacts ? 'bad' : 'ok'}`} title={impactTitle}>
         {hasImpacts ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
-        <span>{hasImpacts ? `${events.length} sensor impact${events.length > 1 ? 's' : ''} detected` : 'No sensor impacts'}</span>
+        <span>{hasImpacts ? `${events.length} landmark contact${events.length > 1 ? 's' : ''} detected` : 'No sensor contacts'}</span>
       </div>
 
       <div className={`qualityPill ${orientationTone}`} title={orientationTitle}>

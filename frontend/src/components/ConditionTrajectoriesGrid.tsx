@@ -1,12 +1,16 @@
-import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { MouseEvent as ReactMouseEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
-import { Area, AreaChart, CartesianGrid, Legend, Line, LineChart, Tooltip, XAxis, YAxis } from 'recharts';
+import { Area, AreaChart, CartesianGrid, Tooltip, XAxis, YAxis } from 'recharts';
 import {
-  fetchPerformanceCorrelations, fetchSessionDetail, fetchTrialRows, invalidateDerivedCaches, refreshIndex, saveAnnotation,
-  saveManualInOrder, saveManualTargetFound, saveTargetCoordinate, swapPhase,
+  fetchPerformanceCorrelations, fetchSessionDetail, fetchTaskSplits, fetchTrialRows, invalidateDerivedCaches, refreshIndex,
+  saveAnnotation, saveManualInOrder, saveManualTargetFound, saveTargetCoordinate, saveTaskSplit, swapPhase,
 } from '../api';
+import type { TaskSplit } from '../api';
 import { ChartFrame } from './ChartFrame';
 import { InfoPopover, InfoSection, Tex } from './InfoPopover';
+import { routeLabel } from '../lib/route';
+import { conditionLabel } from '../lib/glossary';
+import { useEditMode } from '../lib/editMode';
 import type {
   MetricSummary, NavMetrics, PerformanceCorrelations, PerformanceScoreDetails, SessionPayload, SessionRow,
   TargetDiscovery, TargetDiscoveryEntry, TrackingPoint, TrialRow,
@@ -153,6 +157,27 @@ function fmt(value: number | null | undefined, digits = 1, suffix = '') {
   return `${value.toFixed(digits)}${suffix}`;
 }
 
+/** "3 · 6.2 s": number of stops and the time spent stopped. */
+function fmtStops(count: number | null | undefined, durationS: number | null | undefined) {
+  if (count == null) return '—';
+  return durationS == null ? String(count) : `${count} · ${durationS.toFixed(1)} s`;
+}
+
+/** "38% · 60%": DTW pairs within 0.5 m and within 1.0 m. */
+function fmtMatch(within05: number | null | undefined, within1: number | null | undefined) {
+  if (within05 == null || within1 == null) return '—';
+  return `${within05.toFixed(0)}% · ${within1.toFixed(0)}%`;
+}
+
+function fmtCount(value: number | null | undefined) {
+  return value != null ? String(value) : '—';
+}
+
+/** Room position as "x, y" in metres. */
+function fmtXY(xy: [number, number] | null | undefined) {
+  return xy ? `${xy[0].toFixed(1)}, ${xy[1].toFixed(1)}` : '—';
+}
+
 /** Distance label plus the ideal (learning) point it's measured against, e.g. "1.23 m (ideal 2.1, 4.5)". */
 function fmtDeltaWithIdeal(value: number | null | undefined, ideal: [number, number] | null | undefined) {
   const base = fmt(value, 2, ' m');
@@ -170,23 +195,36 @@ function toSvg(x: number, y: number) {
   };
 }
 
-type MiniEndpoint = { x: number; y: number; rawX: number; rawY: number; t: number };
+/** One seeker sample on the mini map: x/y in SVG units, rawX/rawY the plotted
+ * (possibly smoothed) room position, posX/posY the position as logged. */
+type MiniEndpoint = { x: number; y: number; rawX: number; rawY: number; posX: number | null; posY: number | null; t: number };
 
-function seekerPolyline(payload: SessionPayload): { d: string; start?: MiniEndpoint; end?: MiniEndpoint } {
+function seekerPoints(payload: SessionPayload): MiniEndpoint[] {
   const seeker = payload.config.seeker_id;
-  const rawPts = payload.tracking
+  return payload.tracking
     .filter((p: TrackingPoint) => p.tag_id === seeker && isFiniteNumber(p.x_plot) && isFiniteNumber(p.y_plot) && isFiniteNumber(p.t_s))
-    .sort((a, b) => a.t_s - b.t_s);
-  if (!rawPts.length) return { d: '' };
-  const pts = rawPts.map((p) => toSvg(p.x_plot as number, p.y_plot as number));
-  const d = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join('');
-  const first = rawPts[0];
-  const last = rawPts[rawPts.length - 1];
-  return {
-    d,
-    start: { ...pts[0], rawX: first.x_plot as number, rawY: first.y_plot as number, t: first.t_s },
-    end: { ...pts[pts.length - 1], rawX: last.x_plot as number, rawY: last.y_plot as number, t: last.t_s },
-  };
+    .sort((a, b) => a.t_s - b.t_s)
+    .map((p) => ({
+      ...toSvg(p.x_plot as number, p.y_plot as number),
+      rawX: p.x_plot as number,
+      rawY: p.y_plot as number,
+      posX: isFiniteNumber(p.x) ? p.x : null,
+      posY: isFiniteNumber(p.y) ? p.y : null,
+      t: p.t_s,
+    }));
+}
+
+function pointsPath(pts: MiniEndpoint[]): string {
+  return pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join('');
+}
+
+/** Index of the last sample at or before t (0 when t precedes the recording). */
+function indexAtTime(pts: MiniEndpoint[], t: number): number {
+  let idx = 0;
+  for (let i = 0; i < pts.length; i++) {
+    if (pts[i].t <= t) idx = i; else break;
+  }
+  return idx;
 }
 
 function borderRectSvg(payload: SessionPayload | undefined): { x: number; y: number; width: number; height: number } | null {
@@ -249,7 +287,7 @@ function targetMarkers(payload: SessionPayload) {
 
 function MiniTrajectory({
   payloads, showBorder, showAnchors, showGrid, manualTargets, suppressTrackedTargetIds,
-  idealPath, learnResampledXY, expResampledXY, hoverIndex,
+  idealPath, learnResampledXY, expResampledXY, hoverIndex, splits, pickPhase, onPick,
 }: {
   payloads: Array<{ phase: PhaseName; payload: SessionPayload }>;
   showBorder: boolean;
@@ -277,7 +315,30 @@ function MiniTrajectory({
   /** Index (0..99) into learnResampledXY/expResampledXY currently hovered on
    * the Deviation profile chart, or null when not hovering. */
   hoverIndex?: number | null;
+  /** Time (s) of the marked point E per phase: the route is drawn solid up to
+   * it and dashed after it (the walk back to the start). */
+  splits?: Partial<Record<PhaseName, number | null>>;
+  /** When set, the map is in "pick point E" mode for that phase's trajectory:
+   * the nearest sample follows the mouse and a click reports it. */
+  pickPhase?: PhaseName | null;
+  onPick?: (pt: MiniEndpoint) => void;
 }) {
+  const [pickCandidate, setPickCandidate] = useState<MiniEndpoint | null>(null);
+  const pickPayload = pickPhase ? payloads.find((p) => p.phase === pickPhase)?.payload : undefined;
+  const pickPoints = pickPayload ? seekerPoints(pickPayload) : [];
+  const nearestPickPoint = (e: ReactMouseEvent<SVGSVGElement>): MiniEndpoint | null => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (!rect.width || !rect.height || !pickPoints.length) return null;
+    const mx = ((e.clientX - rect.left) / rect.width) * MINI_W;
+    const my = ((e.clientY - rect.top) / rect.height) * MINI_H;
+    let best = pickPoints[0];
+    let bestD = Infinity;
+    for (const p of pickPoints) {
+      const d = (p.x - mx) ** 2 + (p.y - my) ** 2;
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    return best;
+  };
   const trackedTargets = (payloads.length ? targetMarkers(payloads[0].payload) : [])
     .filter((t) => !suppressTrackedTargetIds?.includes(t.id));
   const manualMarkers = (manualTargets ?? [])
@@ -287,7 +348,13 @@ function MiniTrajectory({
   const anchors = showAnchors && payloads.length ? anchorMarkers(payloads[0].payload) : [];
   const borderRect = showBorder ? borderRectSvg(payloads[0]?.payload) : null;
   return (
-    <svg viewBox={`0 0 ${MINI_W} ${MINI_H}`} className="miniTrajSvg">
+    <svg
+      viewBox={`0 0 ${MINI_W} ${MINI_H}`}
+      className={`miniTrajSvg${pickPhase ? ' picking' : ''}`}
+      onMouseMove={pickPhase ? (e) => setPickCandidate(nearestPickPoint(e)) : undefined}
+      onMouseLeave={pickPhase ? () => setPickCandidate(null) : undefined}
+      onClick={pickPhase ? (e) => { const pt = nearestPickPoint(e); if (pt) onPick?.(pt); } : undefined}
+    >
       <rect x={MARGIN} y={MARGIN} width={MINI_W - 2 * MARGIN} height={MINI_H - 2 * MARGIN}
         fill="none" stroke="var(--border)" strokeWidth={1} rx={3} />
       {showGrid ? (
@@ -324,18 +391,38 @@ function MiniTrajectory({
         const d = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join('');
         return (
           <g className="miniIdealPath">
-            <title>Percorso ideale a linee rette (start → O1 → O2 → O3 → stop) — il riferimento usato per Turn dev.</title>
+            <title>Percorso ideale a linee rette (start → O1 → O2 → O3 → stop) — il riferimento usato per il calcolo di Route efficiency.</title>
             <path d={d} fill="none" stroke={IDEAL_PATH_COLOR} strokeWidth={1.6} strokeDasharray="5 3.5" opacity={0.85} />
           </g>
         );
       })() : null}
       {payloads.map(({ phase, payload }) => {
-        const { d, start, end } = seekerPolyline(payload);
-        if (!d) return null;
+        const pts = seekerPoints(payload);
+        if (!pts.length) return null;
+        const start = pts[0];
+        const end = pts[pts.length - 1];
         const color = phaseColors[phase];
+        const splitT = splits?.[phase];
+        const splitIdx = splitT != null ? indexAtTime(pts, splitT) : null;
+        const ePt = splitIdx != null ? pts[splitIdx] : null;
         return (
           <g key={phase}>
-            <path d={d} fill="none" stroke={color} strokeWidth={1.6} opacity={0.85} />
+            {splitIdx != null ? (
+              <>
+                <path d={pointsPath(pts.slice(0, splitIdx + 1))} fill="none" stroke={color} strokeWidth={1.6} opacity={0.85} />
+                <path d={pointsPath(pts.slice(splitIdx))} fill="none" stroke={color} strokeWidth={1.4} opacity={0.6} strokeDasharray="3 3" />
+              </>
+            ) : (
+              <path d={pointsPath(pts)} fill="none" stroke={color} strokeWidth={1.6} opacity={0.85} />
+            )}
+            {ePt ? (
+              <g className="miniAnchorMarker">
+                <title>{`${phase} point E (end of route, start of return): t=${ePt.t.toFixed(1)}s, x=${ePt.rawX.toFixed(2)} m, y=${ePt.rawY.toFixed(2)} m`}</title>
+                <rect x={ePt.x - 4} y={ePt.y - 4} width={8} height={8} transform={`rotate(45 ${ePt.x} ${ePt.y})`}
+                  fill="var(--surface)" stroke={color} strokeWidth={1.8} />
+                <text x={ePt.x + 7} y={ePt.y + 3} fontSize={9} fontWeight={700} fill={color}>E</text>
+              </g>
+            ) : null}
             {start ? (
               <circle cx={start.x} cy={start.y} r={3.4} fill="var(--surface)" stroke={color} strokeWidth={1.6} className="miniAnchorMarker">
                 <title>{`${phase} start: t=${start.t.toFixed(1)}s, x=${start.rawX.toFixed(2)} m, y=${start.rawY.toFixed(2)} m`}</title>
@@ -360,7 +447,90 @@ function MiniTrajectory({
           </g>
         );
       })() : null}
+      {pickPhase && pickCandidate ? (
+        <g pointerEvents="none">
+          <circle cx={pickCandidate.x} cy={pickCandidate.y} r={5.5} fill="none" stroke={phaseColors[pickPhase]} strokeWidth={2} />
+          <text x={pickCandidate.x + 8} y={pickCandidate.y - 6} fontSize={9} fontWeight={700} fill="currentColor">
+            {`t=${pickCandidate.t.toFixed(1)}s`}
+          </text>
+        </g>
+      ) : null}
     </svg>
+  );
+}
+
+/** Mark point E on one trial card: the moment the participant ends the route
+ * and starts walking back to the starting point. Saved per recording. */
+function TaskSplitEditor({
+  phases, phase, onPhase, points, savedT, draftT, onDraftT, picking, onPicking, onCommit, saving, error, marks,
+}: {
+  /** Saved point E time per recording of the trial (null = not marked). */
+  marks: Partial<Record<PhaseName, number | null>>;
+  phases: PhaseName[];
+  phase: PhaseName;
+  onPhase: (p: PhaseName) => void;
+  points: MiniEndpoint[];
+  savedT: number | null;
+  draftT: number | null;
+  onDraftT: (t: number | null) => void;
+  picking: boolean;
+  onPicking: (v: boolean) => void;
+  onCommit: (t: number | null) => void;
+  saving: boolean;
+  error: string | null;
+}) {
+  if (points.length < 2) return null;
+  const t0 = points[0].t;
+  const t1 = points[points.length - 1].t;
+  const shownT = draftT ?? savedT;
+  return (
+    <div className="miniSplit">
+      <div className="miniCoordFormTitle">
+        Point E — end of route
+        <InfoPopover>
+          <h4>Point E</h4>
+          <p>Marks the moment the participant ends the route (the hypothetical end point E) and starts the second task, walking back to the starting point.</p>
+          <p>Click <strong>Pick on map</strong> and then the trajectory, or drag the slider to move along the recording in time. The route is drawn solid up to E and dashed after it.</p>
+          <p>The mark is saved per recording and does not change any metric.</p>
+        </InfoPopover>
+      </div>
+      <div className="miniSplitRow">
+        {phases.length > 1 ? (
+          <select value={phase} onChange={(e) => onPhase(e.target.value as PhaseName)} title="Which recording to mark">
+            {phases.map((p) => <option key={p} value={p}>{p}</option>)}
+          </select>
+        ) : <span className="miniHintInline">{phase}</span>}
+        <button
+          type="button"
+          className={`miniPhaseSwapBtn${picking ? ' active' : ''}`}
+          onClick={() => onPicking(!picking)}
+          disabled={saving}
+        >
+          {picking ? 'Click the route… (cancel)' : 'Pick on map'}
+        </button>
+        <span className="miniHintInline">
+          {shownT != null ? `E at t = ${shownT.toFixed(1)} s` : 'not set'}{saving ? ' · saving…' : ''}
+        </span>
+        {savedT != null ? (
+          <button type="button" className="miniPhaseSwapBtn" onClick={() => onCommit(null)} disabled={saving}>Clear</button>
+        ) : null}
+      </div>
+      <input
+        type="range"
+        aria-label={`Point E time, ${phase} recording`}
+        min={t0}
+        max={t1}
+        step={0.1}
+        value={shownT ?? t1}
+        onChange={(e) => onDraftT(Number(e.target.value))}
+        onPointerUp={() => { if (draftT != null) onCommit(draftT); }}
+        onKeyUp={() => { if (draftT != null) onCommit(draftT); }}
+      />
+      <span className="miniHintInline">
+        {PHASES.map((p) => `${p}: ${marks[p] != null ? `marked (${(marks[p] as number).toFixed(1)} s)` : 'not marked'}`).join(' · ')}
+      </span>
+      {error ? <span className="miniSavingHint miniSavingError">{error}</span> : null}
+    </div>
   );
 }
 
@@ -382,7 +552,7 @@ const OVERLAP_INFO = (
     </p>
     <Tex tex={String.raw`d_i = \min_j\ \mathrm{dist}(exp_i,\ learn_j)`} />
     <Tex tex={String.raw`\text{Overlap} \% = 100 \times \dfrac{\left|\{\,i : d_i \le 0.5\text{m}\,\}\right|}{N}`} />
-    <p>Measures "stayed in the area the learning route covered" — can be high even for a very different-shaped or backtracking path, since a winding learning route sweeps a wide corridor. For an order-respecting version, see Shape overlap.</p>
+    <p>Measures "stayed in the area the learning route covered" — can be high even for a very different-shaped or backtracking route, since a winding learning route sweeps a wide corridor. For an order-respecting version, see Shape overlap.</p>
   </>
 );
 
@@ -448,20 +618,30 @@ const STAT_INFO: Record<string, ReactNode> = {
   'Fréchet': FRECHET_INFO,
   'DTW': DTW_INFO,
   'LCSS': LCSS_INFO,
-  'Turn dev': <p>Mean degrees the exploration's turn angle differs from the learning phase's angle, averaged over the turns (up to 3) auto-detected along the learned route. Turns are wherever the learning trajectory actually turned — not assumed to be 90°.</p>,
-  'Wrong turns': <p>Of the auto-detected learned turns (up to 3), how many the exploration either missed entirely (never came within 1.5 m of that point) or took at an angle more than 45° off the learned turn.</p>,
-  'Stop Δ': <p>Distance between the exploration's last tracked position and the learning trajectory's own end point — the "ideal" stop location, whose coordinates are shown in brackets.</p>,
-  'Start Δ': <p>Distance between the exploration's first tracked position and the learning trajectory's own start point — the "ideal" start location, whose coordinates are shown in brackets.</p>,
-  'Stops': <p>Number of times the participant paused (speed below 0.08 m/s for at least 1 s) during this exploration attempt.</p>,
-  'Border': <p>Number of times the participant stepped outside the centered 8×6 m safety box during this exploration attempt.</p>,
+  'Stop Δ': <p>Distance from the end point: between the point E marked on the learning recording and the point E marked on the exploration recording (x, y in metres). Empty until both are marked.</p>,
+  'Tags found': <p>Landmark units found during the first task of the exploration recording: first signal at or before the marked point E, with whether they were found in the taught order. A find confirmed by hand has no time and is counted. Empty until point E is marked.</p>,
+  'DTW match': <p>How much of the route walked from memory corresponds to the taught one: DTW pairs each point of the learning route (the first task, cut at point E) with the best-matching point of the exploration route; this is the share of those pairs that lie within 0.5 m · within 1.0 m of each other.</p>,
+  'DTW match return': <p>Same correspondence index for the two walks back (the second task): share of the DTW-matched pairs within 0.5 m · within 1.0 m.</p>,
+  'DTW return': <p>DTW between the two walks back: the second task of the learning recording and the second task of the exploration recording, each cut from its own marked point E to its end and resampled to 100 points. The two walks start from different points E, so this value also carries the end-point error of the first task. Empty until both points are marked.</p>,
+  'Route S→E': <p>First task of the exploration recording, from its start to the marked point E: trajectory length on the horizontal plane, duration, and speed (length ÷ duration). Empty until point E is marked.</p>,
+  'Return E→S': <p>Second task of the exploration recording, from the marked point E to its end: trajectory length on the horizontal plane, duration, and speed (length ÷ duration). Empty until point E is marked.</p>,
+  'Learning S→E': <p>First task of the learning recording, from its start to its own marked point E: length, duration and speed. Empty until point E is marked on the learning recording.</p>,
+  'Learning E→S': <p>Second task of the learning recording, from its own marked point E to its end: length, duration and speed. Empty until point E is marked on the learning recording.</p>,
+  'Start Δ': <p>Distance between the learning recording's first tracked position (the taught starting point S) and the exploration's first tracked position (x, y in metres).</p>,
+  'Stops': <p>Number of pauses during this exploration attempt: stretches of at least 1 s in which the hand-held unit P1 stays within 0.141 m (its position error) of where the pause started (stay points, Li et al. 2008). Data gaps are never pauses. Inside First task / Second task: only the pauses that start before / after the marked point E.</p>,
+  'Border': <p>Number of times the participant stepped outside the centered 8×6 m safety box during this exploration attempt. A crossing counts when the hand-held unit goes more than 0.141 m (its position error) outside the box; the next one only after it has come back more than 0.141 m inside. Inside First task / Second task: only the crossings that start before / after the marked point E.</p>,
+  'Impacts': <p>Probable physical hits on the landmark units (their acceleration spiking above the resting level) during this exploration attempt. Inside First task / Second task: only the hits that start before / after the marked point E.</p>,
   'Duration': <p>Length of this exploration attempt.</p>,
-  'Feedback': <p>Number of feedback events (audio/haptic cues) delivered during this attempt.</p>,
-  'Mean intensity': <p>Average intensity of the feedback delivered during this attempt.</p>,
-  'Mean speed': <p>Average walking speed during this exploration attempt.</p>,
-  'Min closest': <p>Closest distance reached to any target during this exploration attempt.</p>,
-  'Return Δ': <p>Distance between the exploration's LAST tracked position and its own FIRST tracked position (same recording, not the learning session) — did they go out and come back to where they themselves started? This is how "completed the path" is defined.</p>,
-  'Found': <p>How many of the trial's targets (O1/O2/O3) triggered at least one feedback event during this exploration attempt, out of how many were placed on this path. "in order"/"out of order" compares the order they were first triggered against the path's intended visit order (from the learning session).</p>,
-  'Impacts': <p>Total probable physical hits on any target sensor during this exploration attempt (a target's accelerometer spiking above its stationary baseline).</p>,
+  'Mean speed': <p>Walking speed during this exploration attempt: trajectory length on the horizontal plane divided by the duration of the recording.</p>,
+  'Data gaps': <p>Stretches where the position of P1 stays exactly the same for 1 s or more: the tracking stopped updating, so these are holes in the data, not pauses. Shown as count · total duration; they are left out of the pauses.</p>,
+  'Data gaps (learning)': <p>Same data gaps on the learning recording of this trial.</p>,
+  'Pause time': <p>Total time spent in pauses (P1 within 0.141 m for at least 1 s) during this task of the exploration attempt. A pause that runs across the marked point E is shared between the two tasks by the time it spends in each.</p>,
+  'Pauses (learning)': <p>Same pauses on the learning recording of this trial: how many start in this task and the time spent stopped in it.</p>,
+  'Movement': <p>Movement intensity of the exploration attempt: mean of the size of the hand-held unit’s linear acceleration (m/s²), leaving out the samples at zero (sensor not active). Higher means the hand moved more — sweeping, turning, hesitating.</p>,
+  'Movement (learning)': <p>Same movement intensity on the learning recording of this trial.</p>,
+  'Min closest': <p>Closest distance reached to any landmark unit during the first task of this exploration attempt (up to the marked point E), measured on the horizontal plane (x, y) like the route length — the height of the hand-held unit is left out. Empty until point E is marked.</p>,
+  'Return Δ': <p>Return distance: between the learning recording's FIRST tracked position (the taught starting point S) and the exploration's LAST tracked position — how far from S the walk back ended (x, y in metres).</p>,
+  'Found': <p>How many of the trial's landmarks (O1/O2/O3) triggered at least one feedback event during this exploration attempt, out of how many were placed on this route. "in order"/"out of order" compares the order they were first triggered against the route's intended visit order (from the learning session).</p>,
 };
 
 function fmtFound(td: TargetDiscovery | null): string {
@@ -491,7 +671,7 @@ function DeviationProfileChart({
         <InfoPopover>
           <h4>Deviation profile</h4>
           <p>Distance between the learning and exploration routes at each relative position along the route — the same 100 arc-length-resampled points (k = 0..99) used for Shape overlap/DTW, charted instead of collapsed into one average.</p>
-          <p>Shows WHERE along the route the two diverged (e.g. a spike near a turn or a target), not just how much on average. The mean of this curve equals "Shape dev" in the stats above.</p>
+          <p>Shows WHERE along the route the two diverged (e.g. a spike near a turn or a landmark), not just how much on average. The mean of this curve equals "Shape dev" in the stats above.</p>
           <p>Hover the chart to highlight the matching point on the map above (learning in blue, exploration in orange).</p>
         </InfoPopover>
       </div>
@@ -529,76 +709,17 @@ function DeviationProfileChart({
   );
 }
 
-const COMBINED_DEVIATION_COLORS = ['#3b5bfd', '#f79009', '#12b76a', '#d92d20', '#7a5af8', '#0891b2', '#e04f9e', '#a16207'];
-
-/** All 8 condition×path Deviation profiles for the current patient, overlaid
- * on one chart instead of scattered one-per-mini-card — one shared Y axis
- * (Recharts scales it from ALL series together, absolute meters, not
- * per-line), so a badly-diverging trial stays visually large next to a good
- * one instead of being independently rescaled away. */
-function CombinedDeviationChart({ series }: { series: Array<{ key: string; label: string; profile: number[] }> }) {
-  if (!series.length) return null;
-  const maxLen = Math.max(...series.map((s) => s.profile.length));
-  const data = Array.from({ length: maxLen }, (_, k) => {
-    const row: Record<string, number | null> = { pct: k };
-    for (const s of series) row[s.key] = s.profile[k] ?? null;
-    return row;
-  });
-  return (
-    <div className="combinedDeviationChart">
-      <div className="miniDeviationChartTitle">
-        Deviation profile — all conditions/paths
-        <InfoPopover>
-          <h4>Deviation profile — combined</h4>
-          <p>The same per-point distance as each mini-card's own Deviation profile chart below, overlaid here for all of this patient's condition×path trials — one line per trial.</p>
-          <p>The Y axis is shared and absolute (meters), not rescaled per line: a badly-diverging trial stays visually large relative to a good one, instead of every line being independently stretched to fill the same height.</p>
-        </InfoPopover>
-      </div>
-      <ChartFrame height={230} minWidth={320}>{(width, height) => (
-        <LineChart width={width} height={height} data={data} margin={{ top: 8, right: 12, bottom: 8, left: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey="pct" tick={{ fontSize: 10 }} tickFormatter={(v) => `${v}%`} />
-          <YAxis unit="m" tick={{ fontSize: 10 }} />
-          <Tooltip
-            animationDuration={0}
-            isAnimationActive={false}
-            labelFormatter={(v: unknown) => `${v}% along route`}
-            formatter={(v: unknown, name: unknown) => [
-              typeof v === 'number' ? `${v.toFixed(2)} m` : '—',
-              series.find((s) => s.key === name)?.label ?? String(name),
-            ]}
-          />
-          <Legend wrapperStyle={{ fontSize: 10 }} formatter={(value: string) => series.find((s) => s.key === value)?.label ?? value} />
-          {series.map((s, i) => (
-            <Line
-              key={s.key}
-              type="monotone"
-              dataKey={s.key}
-              name={s.key}
-              stroke={COMBINED_DEVIATION_COLORS[i % COMBINED_DEVIATION_COLORS.length]}
-              strokeWidth={1.6}
-              dot={false}
-              isAnimationActive={false}
-              connectNulls
-            />
-          ))}
-        </LineChart>
-      )}</ChartFrame>
-    </div>
-  );
-}
-
 /** key in PerformanceCorrelations['correlations'] -> human label, in the
  * same order the backend computes them (speed then acceleration, each
  * against endpoint/target/border in that order). */
 const CORRELATION_LABELS: Record<string, string> = {
   speed_vs_endpoint_distance: 'Mean speed vs. distance to end point',
-  speed_vs_target_distance: 'Mean speed vs. avg. distance to each target',
-  speed_vs_targets_found: 'Mean speed vs. fraction of targets found',
+  speed_vs_target_distance: 'Mean speed vs. avg. distance to each landmark',
+  speed_vs_targets_found: 'Mean speed vs. fraction of landmarks reached',
   speed_vs_border_crossings: 'Mean speed vs. border crossings',
   accel_vs_endpoint_distance: 'Peak acceleration vs. distance to end point',
-  accel_vs_target_distance: 'Peak acceleration vs. avg. distance to each target',
-  accel_vs_targets_found: 'Peak acceleration vs. fraction of targets found',
+  accel_vs_target_distance: 'Peak acceleration vs. avg. distance to each landmark',
+  accel_vs_targets_found: 'Peak acceleration vs. fraction of landmarks reached',
   accel_vs_border_crossings: 'Peak acceleration vs. border crossings',
 };
 
@@ -635,7 +756,8 @@ function PerformanceInfo({
   return (
     <>
       <h4>Performance score</h4>
-      <p>1-5 rating of how well this exploration attempt achieved the stated goal: end up as close as possible to the learning route's own end point and to EACH target (O1-O3) individually, having actually found them, without repeatedly leaving the 8×6 m safety border (a penalty even for an attempt that otherwise finished).</p>
+      <p>1-5 rating of how well this exploration attempt achieved the stated goal: end up as close as possible to the learning route's own end point and to EACH landmark (O1-O3) individually, having actually found them, without repeatedly leaving the 8×6 m safety border (a penalty even for an attempt that otherwise finished).</p>
+      <p>Normalizing each component to 0–1, weighting, summing, then mapping onto an ordinal scale follows the same general composite-scoring approach as <a href="https://doi.org/10.1016/S0166-4115(08)62386-9" target="_blank" rel="noreferrer">NASA-TLX</a> (Hart &amp; Staveland, 1988) for blending several subscales into one score — cited here as a methodological precedent for the blending technique, not as a validated wayfinding/mobility instrument: the four components and their weights below are our own, not from a published scale.</p>
       <InfoSection heading="Variables used for this trial">
         <ul>
           {details.components.map((c) => (
@@ -647,7 +769,7 @@ function PerformanceInfo({
         <p>composite = Σ(weight × normalized) = {details.composite != null ? details.composite.toFixed(2) : '—'} → score = round(1 + 4 × composite) = <strong>{details.score}/5</strong>.</p>
       </InfoSection>
       {details.target_breakdown.length ? (
-        <InfoSection heading="Distance to each target">
+        <InfoSection heading="Distance to each landmark">
           <ul>
             {details.target_breakdown.map((t) => (
               <li key={t.target_id}>
@@ -655,7 +777,7 @@ function PerformanceInfo({
               </li>
             ))}
           </ul>
-          <p>"Target proximity" above is the mean of these; "Targets found" is how many are marked found here out of {details.target_breakdown.length}.</p>
+          <p>"Landmark proximity" above is the mean of these; "Landmarks reached" is how many are marked found here out of {details.target_breakdown.length}.</p>
         </InfoSection>
       ) : null}
       <InfoSection heading="Why not speed/acceleration?">
@@ -711,22 +833,22 @@ function NavMetricsInfo({ metrics }: { metrics: NavMetrics }) {
     <>
       <h4>Navigation metrics</h4>
       <p>Four measures reported individually — unlike the Performance score above, nothing here is combined or weighted into a single number. Provenance varies per measure (see each section); not all are verified as named orientation-and-mobility (O&M)/blind-mobility terms.</p>
-      <InfoSection heading="Path efficiency">
-        <p>Ideal (shortest, waypoint-to-waypoint) path length ÷ actual distance traveled. This exact ratio is "path efficiency" in{' '}
+      <InfoSection heading="Route efficiency">
+        <p>Ideal (shortest, waypoint-to-waypoint) route length ÷ actual distance traveled. This exact ratio is "route efficiency" in{' '}
           <a href="https://en.wikipedia.org/wiki/Morris_water_maze" target="_blank" rel="noreferrer">Morris water maze</a> spatial-navigation research (rodent studies); human{' '}
-          <a href="https://en.wikipedia.org/wiki/Wayfinding" target="_blank" rel="noreferrer">wayfinding</a> research uses the inverse ("path ratio" = actual/ideal). 100% = as short as geometrically possible.
+          <a href="https://en.wikipedia.org/wiki/Wayfinding" target="_blank" rel="noreferrer">wayfinding</a> research uses the inverse ("route ratio" = actual/ideal). 100% = as short as geometrically possible.
         </p>
         <Tex tex={String.raw`d_{ideal} = \sum_{i} \mathrm{dist}(\text{waypoint}_i,\ \text{waypoint}_{i+1}) \quad (\text{start} \to O_1 \to O_2 \to O_3 \to \text{stop})`} />
-        <Tex tex={String.raw`\text{Path efficiency} \% = 100 \times \dfrac{d_{ideal}}{d_{actual}}`} />
-        <p className="statInfoIntro">Every waypoint above — start, O1/O2/O3, stop — is taken from the LEARNING recording's own tracked positions, not some independently defined "ideal" route: <Sub base="d" sub="ideal" /> is the straight-line distance connecting where learning started, visited each target, and ended. <Sub base="d" sub="actual" /> is the distance actually walked in the EXPLORATION attempt being scored here.</p>
+        <Tex tex={String.raw`\text{Route efficiency} \% = 100 \times \dfrac{d_{ideal}}{d_{actual}}`} />
+        <p className="statInfoIntro">Every waypoint above — start, O1/O2/O3, stop — is taken from the LEARNING recording's own tracked positions, not some independently defined "ideal" route: <Sub base="d" sub="ideal" /> is the straight-line distance connecting where learning started, visited each landmark, and ended. <Sub base="d" sub="actual" /> is the distance actually walked in the EXPLORATION attempt being scored here.</p>
         <p>{metrics.ideal_path_length_m != null ? metrics.ideal_path_length_m.toFixed(2) : '—'} m ideal ÷ {metrics.actual_path_length_m != null ? metrics.actual_path_length_m.toFixed(2) : '—'} m actual = <strong>{fmtPct(metrics.path_efficiency_pct)}</strong>.</p>
         {metrics.path_efficiency_pct != null && metrics.path_efficiency_pct > 120 ? (
           <p>Above ~100% usually means the attempt was short or interrupted before covering the ideal route — not unusually efficient movement.</p>
         ) : null}
       </InfoSection>
-      <InfoSection heading="Target acquisition rate">
-        <p>Fraction of this path's targets actually found (feedback or manual-distance confirmed) — the standard task-success-rate measure in search/assistive-technology studies. A target walked past but never triggered still counts as not found here, even if geometrically close.</p>
-        <Tex tex={String.raw`\text{Target acquisition} \% = 100 \times \dfrac{\text{targets found}}{\text{targets total}}`} />
+      <InfoSection heading="Landmarks reached">
+        <p>Fraction of this route's landmarks actually found (feedback or manual-distance confirmed) — the standard task-success-rate measure in search/assistive-technology studies. A landmark walked past but never triggered still counts as not found here, even if geometrically close.</p>
+        <Tex tex={String.raw`\text{Landmarks reached} \% = 100 \times \dfrac{\text{landmarks reached}}{\text{landmarks total}}`} />
         <p><strong>{metrics.targets_found ?? '—'} / {metrics.targets_total ?? '—'}</strong> found ({fmtPct(metrics.target_acquisition_pct)})</p>
         {metrics.target_breakdown.length ? (
           <ul>
@@ -765,8 +887,8 @@ function NavMetricsRow({ metrics }: { metrics: NavMetrics | null }) {
         <InfoPopover width={440}><NavMetricsInfo metrics={metrics} /></InfoPopover>
       </span>
       <span className="miniNavStats">
-        <span>Path eff. <strong>{fmtPct(metrics.path_efficiency_pct)}</strong></span>
-        <span>Targets <strong>{metrics.targets_found ?? '—'}/{metrics.targets_total ?? '—'}</strong></span>
+        <span>Route eff. <strong>{fmtPct(metrics.path_efficiency_pct)}</strong></span>
+        <span>Landmarks <strong>{metrics.targets_found ?? '—'}/{metrics.targets_total ?? '—'}</strong></span>
         <span>Homing <strong>{metrics.endpoint_error_m != null ? `${metrics.endpoint_error_m.toFixed(2)} m` : '—'}</strong></span>
         <span>Border <strong>{metrics.boundary_contacts ?? '—'}</strong></span>
       </span>
@@ -791,31 +913,114 @@ export function TrialMiniStats({
     return () => { cancelled = true; };
   }, []);
 
-  const stats: Array<[string, string]> = row ? [
-    ['Overlap', fmt(row.overlap_pct, 0, '%')],
-    ['Shape overlap', fmt(row.shape_overlap_pct, 0, '%')],
-    ['Fréchet', fmt(row.frechet_distance_m, 2, ' m')],
-    ['DTW', fmt(row.dtw_distance_m, 2, ' m')],
-    ['LCSS', fmt(row.lcss_pct, 0, '%')],
-    ['Turn dev', fmt(row.mean_turn_deviation_deg, 0, '°')],
-    ['Wrong turns', row.wrong_turns_count != null ? String(row.wrong_turns_count) : '—'],
-    ['Stop Δ', fmtDeltaWithIdeal(row.stop_position_distance_m, row.ideal_stop_xy)],
-    ['Start Δ', fmtDeltaWithIdeal(row.start_position_distance_m, row.ideal_start_xy)],
-    ['Return Δ', fmt(row.self_return_distance_m, 2, ' m')],
-    ['Found', fmtFound(row.target_discovery)],
-    ['Impacts', String(Object.values(row.target_impacts ?? {}).reduce((a, b) => a + b, 0))],
-    ['Stops', row.stop_count != null ? String(row.stop_count) : '—'],
-    ['Border', row.border_reached_count != null ? String(row.border_reached_count) : '—'],
+  // Tags (landmark units) found during task 1: first signal at or before the
+  // marked point E. A manually confirmed find has no time and is counted.
+  const splitT = row?.exploration_split_t_s ?? null;
+  const td = row?.target_discovery ?? null;
+  const tagsInTask1 = (() => {
+    if (!td || !td.targets.length || splitT == null) return '—';
+    const inTask1 = td.targets.filter((t) => t.found && (t.first_feedback_t_s == null || t.first_feedback_t_s <= splitT));
+    // Same set as the whole recording: reuse its order (it carries any manual
+    // override). Otherwise order the timed finds against the taught order.
+    let inOrder: boolean | null = td.in_order;
+    if (inTask1.length !== td.found_count) {
+      const timed = inTask1.filter((t) => t.first_feedback_t_s != null)
+        .sort((x, y) => (x.first_feedback_t_s as number) - (y.first_feedback_t_s as number));
+      inOrder = timed.every((t, i) => i === 0 || timed[i - 1].path_order < t.path_order);
+    }
+    const orderTag = inTask1.length === 0 || inOrder == null ? '' : inOrder ? ' (in order)' : ' (out of order)';
+    return `${inTask1.length}/${td.targets.length}${orderTag}`;
+  })();
+  type Segment = [string, number | null, number | null, number | null];
+  type PointRow = { label: string; info: string; learning: [number, number] | null; exploration: [number, number] | null; delta: number | null };
+  /** One measure: its value in the exploration phase and, when it exists, in
+   * the learning phase of the same trial. Secondary rows are folded away. */
+  type MeasureRow = { label: string; info?: string; exploration: string; learning?: string; secondary?: boolean };
+  type Group = { title: string; subtitle?: string; task?: boolean; needsE?: boolean; segments?: Segment[]; point?: PointRow; rows: MeasureRow[] };
+  const contacts = (n: number | null | undefined) => fmtCount(n);
+  const groups: Group[] = row ? [
+    {
+      title: 'First task',
+      subtitle: 'starting point S → end point E',
+      task: true,
+      needsE: true,
+      segments: [
+        ['Exploration', row.exploration_task1_length_m, row.exploration_task1_duration_s, row.exploration_task1_speed_m_s],
+        ['Learning', row.learning_task1_length_m, row.learning_task1_duration_s, row.learning_task1_speed_m_s],
+      ],
+      point: {
+        label: 'End point (E)', info: 'Stop Δ',
+        learning: row.learning_split_xy, exploration: row.exploration_split_xy, delta: row.stop_position_distance_m,
+      },
+      rows: [
+        { label: 'Trajectory distance (DTW)', info: 'DTW', exploration: fmt(row.dtw_distance_m, 2, ' m') },
+        { label: 'Correspondence index (0.5 · 1.0 m)', info: 'DTW match', exploration: fmtMatch(row.dtw_match_05m_pct, row.dtw_match_1m_pct) },
+        { label: 'Pauses (count · time)', info: 'Stops', exploration: fmtStops(row.exploration_task1_pause_count, row.exploration_task1_pause_duration_s), learning: fmtStops(row.learning_task1_pause_count, row.learning_task1_pause_duration_s) },
+        { label: 'Movement intensity', info: 'Movement', exploration: fmt(row.exploration_task1_movement_intensity_m_s2, 2, ' m/s²'), learning: fmt(row.learning_task1_movement_intensity_m_s2, 2, ' m/s²') },
+        { label: 'Border crossings', info: 'Border', exploration: fmtCount(row.exploration_task1_border_reached_count) },
+        { label: 'Contacts', info: 'Impacts', exploration: contacts(row.exploration_task1_impact_count) },
+        { label: 'Landmarks reached', info: 'Tags found', exploration: tagsInTask1 },
+        { label: 'Closest distance', info: 'Min closest', exploration: fmt(row.exploration_task1_min_closest_distance_m, 2, ' m') },
+        { label: 'Data gaps (count · time)', info: 'Data gaps', exploration: fmtStops(row.exploration_task1_data_gap_count, row.exploration_task1_data_gap_duration_s), learning: fmtStops(row.learning_task1_data_gap_count, row.learning_task1_data_gap_duration_s), secondary: true },
+      ],
+    },
+    {
+      title: 'Second task',
+      subtitle: 'end point E → starting point S',
+      task: true,
+      needsE: true,
+      segments: [
+        ['Exploration', row.exploration_task2_length_m, row.exploration_task2_duration_s, row.exploration_task2_speed_m_s],
+        ['Learning', row.learning_task2_length_m, row.learning_task2_duration_s, row.learning_task2_speed_m_s],
+      ],
+      point: {
+        label: 'Return (S)', info: 'Return Δ',
+        learning: row.ideal_start_xy, exploration: row.exploration_end_xy ?? null, delta: row.return_to_start_distance_m,
+      },
+      rows: [
+        { label: 'Trajectory distance (DTW)', info: 'DTW return', exploration: fmt(row.dtw_task2_distance_m, 2, ' m') },
+        { label: 'Correspondence index (0.5 · 1.0 m)', info: 'DTW match return', exploration: fmtMatch(row.dtw_task2_match_05m_pct, row.dtw_task2_match_1m_pct) },
+        { label: 'Pauses (count · time)', info: 'Stops', exploration: fmtStops(row.exploration_task2_pause_count, row.exploration_task2_pause_duration_s), learning: fmtStops(row.learning_task2_pause_count, row.learning_task2_pause_duration_s) },
+        { label: 'Movement intensity', info: 'Movement', exploration: fmt(row.exploration_task2_movement_intensity_m_s2, 2, ' m/s²'), learning: fmt(row.learning_task2_movement_intensity_m_s2, 2, ' m/s²') },
+        { label: 'Border crossings', info: 'Border', exploration: fmtCount(row.exploration_task2_border_reached_count) },
+        { label: 'Contacts', info: 'Impacts', exploration: contacts(row.exploration_task2_impact_count) },
+        { label: 'Data gaps (count · time)', info: 'Data gaps', exploration: fmtStops(row.exploration_task2_data_gap_count, row.exploration_task2_data_gap_duration_s), learning: fmtStops(row.learning_task2_data_gap_count, row.learning_task2_data_gap_duration_s), secondary: true },
+      ],
+    },
+    {
+      title: 'Whole recording',
+      subtitle: 'S → E → S',
+      task: true,
+      segments: [
+        ['Exploration', row.exploration_length_m, row.exploration_duration_s, row.exploration_speed_m_s],
+        ['Learning', row.learning_length_m, row.learning_duration_s, row.learning_speed_m_s],
+      ],
+      point: {
+        label: 'Start (S)', info: 'Start Δ',
+        learning: row.ideal_start_xy, exploration: row.exploration_start_xy ?? null, delta: row.start_position_distance_m,
+      },
+      rows: [
+        { label: 'Pauses (count · time)', info: 'Stops', exploration: fmtStops(row.exploration_pause_count, row.exploration_pause_duration_s), learning: fmtStops(row.learning_pause_count, row.learning_pause_duration_s) },
+        { label: 'Movement intensity', info: 'Movement', exploration: fmt(row.exploration_movement_intensity_m_s2, 2, ' m/s²'), learning: fmt(row.learning_movement_intensity_m_s2, 2, ' m/s²') },
+        { label: 'Border crossings', info: 'Border', exploration: fmtCount(row.border_reached_count) },
+        { label: 'Contacts', info: 'Impacts', exploration: String(Object.values(row.target_impacts ?? {}).reduce((a, b) => a + b, 0)) },
+        { label: 'Landmarks reached', info: 'Found', exploration: fmtFound(row.target_discovery) },
+        { label: 'Data gaps (count · time)', info: 'Data gaps', exploration: fmtStops(row.exploration_data_gap_count, row.exploration_data_gap_duration_s), learning: fmtStops(row.learning_data_gap_count, row.learning_data_gap_duration_s), secondary: true },
+      ],
+    },
   ] : [];
-  if (metrics) {
-    stats.push(
-      ['Duration', fmt(metrics.duration_s, 0, 's')],
-      ['Feedback', metrics.feedback_events != null ? String(metrics.feedback_events) : '—'],
-      ['Mean intensity', fmt(metrics.mean_intensity, 0)],
-      ['Mean speed', fmt(metrics.mean_speed_m_s, 2, ' m/s')],
-      ['Min closest', fmt(metrics.min_closest_distance, 2, ' m')],
-    );
+  if (!row && metrics) {
+    groups.push({ title: 'Whole recording', rows: [
+      { label: 'Duration', info: 'Duration', exploration: fmt(metrics.duration_s, 0, 's') },
+      { label: 'Walking speed', info: 'Mean speed', exploration: fmt(metrics.mean_speed_m_s, 2, ' m/s') },
+      { label: 'Closest distance', info: 'Min closest', exploration: fmt(metrics.min_closest_distance, 2, ' m') },
+    ] });
   }
+  // The first- and second-task measures need point E marked in both phases.
+  const missingE = row
+    ? [row.learning_split_t_s == null ? 'learning' : null, row.exploration_split_t_s == null ? 'exploration' : null].filter(Boolean) as string[]
+    : [];
+  const stats = groups.flatMap((g) => g.rows);
   if (!stats.length) return <div className="miniTrialStats miniTrialEmpty">No data available.</div>;
   return (
     <div className="miniTrialStats">
@@ -823,23 +1028,89 @@ export function TrialMiniStats({
        * next bulk refetch reflects it in performance_score_details, which the
        * backend already nulls out for an excluded trial — check both so the
        * line disappears immediately either way. */}
+      {/*
       <PerformanceScoreRow
         details={row?.excluded_from_stats ? null : (row?.performance_score_details ?? null)}
         correlations={correlations}
       />
       <NavMetricsRow metrics={row?.excluded_from_stats ? null : (row?.nav_metrics ?? null)} />
-      <div className="miniStatGrid">
-        {stats.map(([label, value]) => (
-          <div key={label}>
-            <span>
-              {label}
-              {STAT_INFO[label] ? <InfoPopover>{STAT_INFO[label]}</InfoPopover> : null}
-            </span>
-            <strong>{value}</strong>
+      */}
+      {missingE.length ? (
+        <div className="miniStatGroup task missingE">
+          <div className="miniStatGroupTitle">First and second task</div>
+          <p>
+            Point E is not marked in the {missingE.join(' and the ')} phase of this trial, so the first- and second-task
+            measures cannot be computed. Mark it in the trial card in Trial metrics (edit mode); the whole-recording
+            values below do not need it.
+          </p>
+        </div>
+      ) : null}
+      {groups.filter((group) => !(group.needsE && missingE.length)).map((group) => {
+        const hasLearning = group.rows.some((r) => r.learning !== undefined);
+        const main = group.rows.filter((r) => !r.secondary);
+        const extra = group.rows.filter((r) => r.secondary);
+        const measureRow = (r: MeasureRow) => (
+          <tr key={r.label}>
+            <td>
+              {r.label}
+              {r.info && STAT_INFO[r.info] ? <InfoPopover>{STAT_INFO[r.info]}</InfoPopover> : null}
+            </td>
+            <td>{r.exploration}</td>
+            {hasLearning ? <td>{r.learning ?? ''}</td> : null}
+          </tr>
+        );
+        return (
+          <div key={group.title} className={`miniStatGroup${group.task ? ' task' : ''}`}>
+            <div className="miniStatGroupTitle">
+              {group.title}
+              {group.subtitle ? <small>{group.subtitle}</small> : null}
+            </div>
+            {group.segments ? (
+              <table className="miniSegmentTable">
+                <thead><tr><th /><th>Trajectory length</th><th>Duration</th><th>Walking speed</th></tr></thead>
+                <tbody>
+                  {group.segments.map(([name, lengthM, durationS, speedMS]) => (
+                    <tr key={name}>
+                      <td>{name}</td>
+                      <td>{fmt(lengthM, 1, ' m')}</td>
+                      <td>{fmt(durationS, 0, ' s')}</td>
+                      <td>{fmt(speedMS, 2, ' m/s')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : null}
+            {group.point ? (
+              <table className="miniSegmentTable">
+                <thead><tr><th /><th>Learning</th><th>Exploration</th><th>Distance</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td>
+                      {group.point.label}
+                      {STAT_INFO[group.point.info] ? <InfoPopover>{STAT_INFO[group.point.info]}</InfoPopover> : null}
+                    </td>
+                    <td>{fmtXY(group.point.learning)}</td>
+                    <td>{fmtXY(group.point.exploration)}</td>
+                    <td>{fmt(group.point.delta, 2, ' m')}</td>
+                  </tr>
+                </tbody>
+              </table>
+            ) : null}
+            <table className="miniSegmentTable miniMeasureTable">
+              <thead><tr><th>Measure</th><th>Exploration</th>{hasLearning ? <th>Learning</th> : null}</tr></thead>
+              <tbody>{main.map(measureRow)}</tbody>
+            </table>
+            {extra.length ? (
+              <details className="miniMoreMeasures">
+                <summary>More: {extra.map((r) => r.label.replace(/ \(.*\)$/, '').toLowerCase()).join(', ')}</summary>
+                <table className="miniSegmentTable miniMeasureTable">
+                  <tbody>{extra.map(measureRow)}</tbody>
+                </table>
+              </details>
+            ) : null}
           </div>
-        ))}
-      </div>
-      <DeviationProfileChart profile={row?.shape_deviation_profile ?? null} onHoverIndex={onHoverDeviationIndex} />
+        );
+      })}
       {row?.got_lost ? (
         <span className="warningBadge miniLostBadge">
           lost / disrupted attempt{row.manual_lost !== null && row.manual_lost !== undefined ? ' (manual)' : ''}
@@ -889,7 +1160,7 @@ function PhaseSwapButton({
     if (!first) return;
     const second = window.confirm(
       `Confermi di nuovo? Questa modifica cambia come TUTTE le metriche di questo trial vengono calcolate `
-      + `(overlap, Fréchet, DTW, found targets, ecc.) finché non la annulli di nuovo.`
+      + `(overlap, Fréchet, DTW, found landmarks, ecc.) finché non la annulli di nuovo.`
     );
     if (!second) return;
 
@@ -912,7 +1183,7 @@ function PhaseSwapButton({
   return (
     <span className="miniPhaseSwap">
       <button type="button" className="miniPhaseSwapBtn" onClick={handleSwap} disabled={saving || applying} title="Scambia quale registrazione è 'learning' e quale è 'exploration' per questo trial, e aggiorna subito questa card">
-        ⇄ {saving ? 'Salvataggio…' : applying ? 'Aggiornamento…' : 'Scambia fasi'}
+        ⇄ {saving ? 'Saving…' : applying ? 'Updating…' : 'Swap phases'}
       </button>
       {done ? <span className="miniSavingHint">Fatto — questa card è aggiornata.</span> : null}
       {error ? <span className="miniSavingHint miniSavingError">{error}</span> : null}
@@ -1038,7 +1309,7 @@ function TargetCoordinateForm({
   targetIds: string[];
   coordsByTarget: Record<string, [number, number] | null>;
   discovery: TargetDiscovery | null;
-  onCoordSaved: (targetId: string, xy: [number, number]) => void;
+  onCoordSaved: (targetId: string, xy: [number, number] | null) => void;
   onDiscoveryChanged: () => void;
 }) {
   const [drafts, setDrafts] = useState<Record<string, { x: string; y: string }>>({});
@@ -1057,12 +1328,15 @@ function TargetCoordinateForm({
     const yStr = valueFor(tid, 'y');
     const x = Number(xStr);
     const y = Number(yStr);
-    if (xStr === '' || yStr === '' || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    // Both fields emptied: remove the saved coordinate, so it does not come back.
+    const clearing = xStr === '' && yStr === '';
+    if (clearing && !coordsByTarget[tid]) return;
+    if (!clearing && (xStr === '' || yStr === '' || !Number.isFinite(x) || !Number.isFinite(y))) return;
     setSavingId(tid);
     setSaveError(null);
     try {
-      await saveTargetCoordinate({ patient, condition, pathId, targetId: tid, x, y });
-      onCoordSaved(tid, [x, y]);
+      await saveTargetCoordinate({ patient, condition, pathId, targetId: tid, x: clearing ? null : x, y: clearing ? null : y });
+      onCoordSaved(tid, clearing ? null : [x, y]);
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1142,7 +1416,7 @@ function TargetCoordinateForm({
           value={discovery?.manual_in_order_override}
           trueLabel="In order"
           falseLabel="Out of order"
-          title={`Override whether the found targets were reached in order — automatic result: ${discovery?.in_order == null ? 'n/a' : discovery.in_order ? 'in order' : 'out of order'}`}
+          title={`Override whether the found landmarks were reached in order — automatic result: ${discovery?.in_order == null ? 'n/a' : discovery.in_order ? 'in order' : 'out of order'}`}
           saving={savingInOrder}
           onChange={(next) => persistInOrder(next)}
         />
@@ -1162,6 +1436,7 @@ function TrialCard({
   cell, patient, payloads, chosenId, trialRows, discoveryOverrides, setDiscoveryOverrides,
   annotationOverrides, setAnnotationOverrides, coordOverrides, setCoordOverrides,
   showBorder, showAnchors, showGrid, showIdealPath, onSetChoice, onAnnotationSaved, onPhaseSwapped,
+  taskSplits, setTaskSplits,
 }: {
   cell: Cell;
   patient: string;
@@ -1172,8 +1447,8 @@ function TrialCard({
   setDiscoveryOverrides: (fn: (prev: Record<string, TrialRow>) => Record<string, TrialRow>) => void;
   annotationOverrides: Record<string, { manual_lost: boolean | null; comment: string; excluded_from_stats: boolean }>;
   setAnnotationOverrides: (fn: (prev: Record<string, { manual_lost: boolean | null; comment: string; excluded_from_stats: boolean }>) => Record<string, { manual_lost: boolean | null; comment: string; excluded_from_stats: boolean }>) => void;
-  coordOverrides: Record<string, [number, number]>;
-  setCoordOverrides: (fn: (prev: Record<string, [number, number]>) => Record<string, [number, number]>) => void;
+  coordOverrides: Record<string, [number, number] | null>;
+  setCoordOverrides: (fn: (prev: Record<string, [number, number] | null>) => Record<string, [number, number] | null>) => void;
   showBorder: boolean;
   showAnchors: boolean;
   showGrid: boolean;
@@ -1181,10 +1456,13 @@ function TrialCard({
   onSetChoice: (condition: string, pathId: string, phase: string, sessionId: number) => void;
   onAnnotationSaved?: (info: { condition: string; pathId: string; explorationSessionId: number | null; excludedFromStats: boolean }) => void;
   onPhaseSwapped: (condition: string, path: string, formerLearningId: number, formerExplorationId: number) => Promise<void>;
+  taskSplits: Record<string, TaskSplit>;
+  setTaskSplits: (next: Record<string, TaskSplit>) => void;
 }) {
   // Index (0..99) hovered on this card's own Deviation profile chart — drives
   // the highlighted point pair on this card's own map, nowhere else.
   const [hoverK, setHoverK] = useState<number | null>(null);
+  const editMode = useEditMode();
 
   const phasePayloads = cell.phases
     .map((cp) => {
@@ -1205,6 +1483,47 @@ function TrialCard({
     r.condition === cell.condition && r.path_id === cell.path && r.exploration_session_id === explorationId
   ) ?? null;
   const explorationMetrics = phasePayloads.find((p) => p.phase === 'exploration')?.payload.metrics ?? null;
+
+  // Point E (end of route / start of the walk back), marked per recording.
+  const [splitPhasePref, setSplitPhasePref] = useState<PhaseName>('exploration');
+  const [splitPicking, setSplitPicking] = useState(false);
+  const [splitDraftT, setSplitDraftT] = useState<number | null>(null);
+  const [splitSaving, setSplitSaving] = useState(false);
+  const [splitError, setSplitError] = useState<string | null>(null);
+  const splitPhases = phasePayloads.map((p) => p.phase);
+  const splitPhase: PhaseName = splitPhases.includes(splitPhasePref) ? splitPhasePref : (splitPhases[0] ?? 'exploration');
+  const splitSession = splitPhase === 'learning' ? learningSession : explorationSession;
+  const splitFileName = splitSession?.file_name ?? null;
+  const splitPayload = phasePayloads.find((p) => p.phase === splitPhase)?.payload;
+  const splitPoints = useMemo(() => (splitPayload ? seekerPoints(splitPayload) : []), [splitPayload]);
+  const splitSavedT = splitFileName ? (taskSplits[splitFileName]?.t_s ?? null) : null;
+  useEffect(() => {
+    setSplitDraftT(null);
+    setSplitPicking(false);
+    setSplitError(null);
+  }, [splitFileName]);
+  const commitSplit = (t: number | null) => {
+    if (!splitFileName || !editMode) return;
+    const pt = t != null && splitPoints.length ? splitPoints[indexAtTime(splitPoints, t)] : null;
+    setSplitSaving(true);
+    setSplitError(null);
+    saveTaskSplit({ fileName: splitFileName, tS: t != null ? Math.round(t * 10) / 10 : null, x: pt?.posX, y: pt?.posY })
+      .then((next) => {
+        setTaskSplits(next);
+        setSplitDraftT((cur) => (cur === t ? null : cur));
+        setSplitPicking(false);
+        // The marked point feeds the per-task and route-comparison metrics.
+        invalidateDerivedCaches(patient);
+        return refetchDiscoveryRow();
+      })
+      .catch((e) => setSplitError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setSplitSaving(false));
+  };
+  const splitsForMap: Partial<Record<PhaseName, number | null>> = {
+    learning: learningSession ? (taskSplits[learningSession.file_name]?.t_s ?? null) : null,
+    exploration: explorationSession ? (taskSplits[explorationSession.file_name]?.t_s ?? null) : null,
+  };
+  if (splitDraftT != null) splitsForMap[splitPhase] = splitDraftT;
 
   // Re-fetch just this one (patient, condition, path) instead of the full
   // bulk /api/trials/compare (30-70s) — used after any manual coordinate,
@@ -1240,7 +1559,7 @@ function TrialCard({
   for (const tid of cellTargetIds) {
     const overrideKey = `${cell.condition}|${cell.path}|${tid}`;
     const fromRow = trialRow?.target_discovery?.targets.find((t) => t.target_id === tid)?.manual_xy ?? null;
-    coordsByTarget[tid] = coordOverrides[overrideKey] ?? fromRow;
+    coordsByTarget[tid] = overrideKey in coordOverrides ? coordOverrides[overrideKey] : fromRow;
   }
   const manualTargetsForCell = isManualCoordsCell
     ? cellTargetIds
@@ -1259,7 +1578,7 @@ function TrialCard({
     <div className={`miniTrajCard ${conditionCardClass(cell.condition)}`}>
       <div className="miniTrajTitle">
         <strong>{cell.label}</strong>
-        <span>{cell.path.replace('_', ' ')}</span>
+        <span>path {routeLabel(cell.path, trialRow?.route_id ?? cell.phases.flatMap((cp) => cp.all)[0]?.route_id)}</span>
       </div>
       {anySession ? (
         <>
@@ -1274,7 +1593,30 @@ function TrialCard({
             learnResampledXY={effectiveRow?.learn_resampled_xy}
             expResampledXY={effectiveRow?.exp_resampled_xy}
             hoverIndex={hoverK}
+            splits={splitsForMap}
+            pickPhase={splitPicking ? splitPhase : null}
+            onPick={(pt) => commitSplit(pt.t)}
           />
+          <fieldset className="editGate" disabled={!editMode} title={editMode ? undefined : "Read only: turn on edit mode to change point E"}>
+          <TaskSplitEditor
+            phases={splitPhases}
+            phase={splitPhase}
+            onPhase={setSplitPhasePref}
+            points={splitPoints}
+            savedT={splitSavedT}
+            draftT={splitDraftT}
+            onDraftT={setSplitDraftT}
+            picking={splitPicking}
+            onPicking={setSplitPicking}
+            onCommit={commitSplit}
+            saving={splitSaving}
+            error={splitError}
+            marks={{
+              learning: learningSession ? (taskSplits[learningSession.file_name]?.t_s ?? null) : null,
+              exploration: explorationSession ? (taskSplits[explorationSession.file_name]?.t_s ?? null) : null,
+            }}
+          />
+          </fieldset>
           <div className="miniTrajStatus">
             {cell.phases.map((cp) => {
               const id = chosenId(cell, cp);
@@ -1307,13 +1649,16 @@ function TrialCard({
                 </span>
               );
             })}
-            <PhaseSwapButton
-              learningSession={learningSession}
-              explorationSession={explorationSession}
-              onSwapped={() => onPhaseSwapped(cell.condition, cell.path, learningSession!.session_id, explorationSession!.session_id)}
-            />
+            <fieldset className="editGate" disabled={!editMode}>
+              <PhaseSwapButton
+                learningSession={learningSession}
+                explorationSession={explorationSession}
+                onSwapped={() => onPhaseSwapped(cell.condition, cell.path, learningSession!.session_id, explorationSession!.session_id)}
+              />
+            </fieldset>
           </div>
           <TrialMiniStats row={effectiveRow} metrics={explorationMetrics} onHoverDeviationIndex={setHoverK} />
+          <fieldset className="editGate" disabled={!editMode}>
           <TrialAnnotationEditor
             patient={patient}
             condition={cell.condition}
@@ -1332,7 +1677,9 @@ function TrialCard({
               });
             }}
           />
+          </fieldset>
           {isManualCoordsCell ? (
+            <fieldset className="editGate" disabled={!editMode}>
             <TargetCoordinateForm
               patient={patient}
               condition={cell.condition}
@@ -1346,10 +1693,11 @@ function TrialCard({
               }}
               onDiscoveryChanged={refetchDiscoveryRow}
             />
+            </fieldset>
           ) : null}
         </>
       ) : (
-        <div className="miniTrajEmpty">No session recorded for this condition/path.</div>
+        <div className="miniTrajEmpty">No session recorded for this condition/route.</div>
       )}
     </div>
   );
@@ -1369,7 +1717,7 @@ export function ConditionTrajectoriesGrid({
   // Manually-entered target coordinates, keyed `${condition}|${path}|${target_id}`
   // — shown immediately (red marker) after saving, without waiting for a
   // full trialRows refetch to see the new found/order recomputation.
-  const [coordOverrides, setCoordOverrides] = useState<Record<string, [number, number]>>({});
+  const [coordOverrides, setCoordOverrides] = useState<Record<string, [number, number] | null>>({});
   // Freshly-recomputed trial row (found/order/etc, now reflecting the just-saved
   // coordinate) fetched with a small scoped request right after saving — the
   // full bulk /api/trials/compare fetch is too slow (30-70s) to redo per-edit.
@@ -1379,6 +1727,13 @@ export function ConditionTrajectoriesGrid({
   // swap only writes a small override on the backend), so no need to wait
   // for a full sessions refetch to see the two recordings' labels swap here.
   const [sessionPhaseOverrides, setSessionPhaseOverrides] = useState<Record<number, PhaseName>>({});
+  // Manually marked point E per recording, keyed by file_name.
+  const [taskSplits, setTaskSplits] = useState<Record<string, TaskSplit>>({});
+  useEffect(() => {
+    let cancelled = false;
+    fetchTaskSplits().then((s) => { if (!cancelled) setTaskSplits(s); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   // After "Scambia fasi": flip the two recordings' labels immediately (no
   // network round-trip needed, see sessionPhaseOverrides above), then clear
@@ -1431,7 +1786,7 @@ export function ConditionTrajectoriesGrid({
     const conditionMap = new Map<string, { label: string; paths: Set<string> }>();
     for (const s of sessions) {
       if (s.patient !== patient || !s.condition || !s.path_id) continue;
-      const entry = conditionMap.get(s.condition) ?? { label: s.condition_label || s.condition, paths: new Set<string>() };
+      const entry = conditionMap.get(s.condition) ?? { label: conditionLabel(s.condition), paths: new Set<string>() };
       entry.paths.add(s.path_id);
       conditionMap.set(s.condition, entry);
     }
@@ -1461,35 +1816,13 @@ export function ConditionTrajectoriesGrid({
     const key = `${cell.condition}|${cell.path}|${cp.phase}`;
     const chosen = choices[key];
     if (chosen !== undefined && cp.all.some((s) => s.session_id === chosen)) return chosen;
+    // A recording fixed by hand on the backend (recording_pins.json) is the default instead of the latest.
+    const pinnedRow = trialRows.find((r) => r.condition === cell.condition && r.path_id === cell.path
+      && (cp.phase === 'exploration' ? r.exploration_pinned : r.learning_pinned));
+    const pinnedId = cp.phase === 'exploration' ? pinnedRow?.exploration_session_id : pinnedRow?.learning_session_id;
+    if (pinnedId != null && cp.all.some((s) => s.session_id === pinnedId)) return pinnedId;
     return cp.all[cp.all.length - 1].session_id;
   };
-
-  // Same row-resolution as each TrialCard (discoveryOverrides ?? trialRows
-  // lookup) but computed once here across all 8 cells, for the combined
-  // "all conditions/paths" deviation profile chart below.
-  const deviationSeries = useMemo(() => {
-    return cells
-      .map((cell) => {
-        const explorationCp = cell.phases.find((cp) => cp.phase === 'exploration');
-        const explorationId = explorationCp ? chosenId(cell, explorationCp) : null;
-        const discoveryKey = `${cell.condition}|${cell.path}`;
-        const row = discoveryOverrides[discoveryKey] ?? trialRows.find((r) =>
-          r.condition === cell.condition && r.path_id === cell.path && r.exploration_session_id === explorationId
-        ) ?? null;
-        // Same override-resolution as each TrialCard's own effectiveExcluded —
-        // a trial flagged bad (hardware error) shouldn't appear in the combined
-        // comparison chart even if it hasn't been refetched into trialRows yet.
-        const annKey = `${cell.condition}|${cell.path}|${explorationId ?? 'none'}`;
-        const excluded = annotationOverrides[annKey]?.excluded_from_stats ?? row?.excluded_from_stats ?? false;
-        return {
-          key: discoveryKey,
-          label: `${cell.label} · ${cell.path.replace('path_', '')}`,
-          profile: excluded ? null : (row?.shape_deviation_profile ?? null),
-        };
-      })
-      .filter((s): s is { key: string; label: string; profile: number[] } => !!s.profile && s.profile.length > 0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cells, choices, trialRows, discoveryOverrides, annotationOverrides]);
 
   const neededIds = useMemo(() => {
     const ids = new Set<number>();
@@ -1501,7 +1834,7 @@ export function ConditionTrajectoriesGrid({
     }
     return [...ids];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cells, choices]);
+  }, [cells, choices, trialRows]);
 
   useEffect(() => {
     const missing = neededIds.filter((id) => !payloads.has(id));
@@ -1540,7 +1873,7 @@ export function ConditionTrajectoriesGrid({
           <input type="checkbox" checked={showGrid} onChange={(e) => onShowGrid(e.target.checked)} />
           Grid 1×1 m
         </label>
-        <label className="inlineCheck" title="Percorso ideale a linee rette (start → O1 → O2 → O3 → stop) — il riferimento ora usato per il calcolo di Turn dev.">
+        <label className="inlineCheck" title="Percorso ideale a linee rette (start → O1 → O2 → O3 → stop) — il riferimento usato per il calcolo di Route efficiency.">
           <input type="checkbox" checked={showIdealPath} onChange={(e) => onShowIdealPath(e.target.checked)} />
           Ideal path
         </label>
@@ -1568,7 +1901,6 @@ export function ConditionTrajectoriesGrid({
           </>
         ) : null}
       </div>
-      <CombinedDeviationChart series={deviationSeries} />
       <div className="miniTrajGrid">
           {cells.map((cell) => (
             <TrialCard
@@ -1591,6 +1923,8 @@ export function ConditionTrajectoriesGrid({
               onSetChoice={onSetChoice}
               onAnnotationSaved={onAnnotationSaved}
               onPhaseSwapped={handlePhaseSwapped}
+              taskSplits={taskSplits}
+              setTaskSplits={setTaskSplits}
             />
           ))}
       </div>
@@ -1604,7 +1938,7 @@ export function ConditionTrajectoriesGrid({
       <div className="cardHeader">
         <div>
           <strong>Learning vs exploration — all trials ({patient})</strong>
-          <small>{cells.length} charts: one per condition × path, with the aggregated trial metrics for the selected attempt.</small>
+          <small>{cells.length} charts: one per condition × route, with the aggregated trial metrics for the selected attempt.</small>
         </div>
         {loading ? <RefreshCw size={15} className="spin" /> : null}
       </div>

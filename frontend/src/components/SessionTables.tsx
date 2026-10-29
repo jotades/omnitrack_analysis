@@ -1,4 +1,6 @@
 import type { SessionPayload, SessionRow } from '../types';
+import { routeLabel } from '../lib/route';
+import { conditionLabel, participantLabel, phaseLabel } from '../lib/glossary';
 
 export function SessionStatusTable({ sessions }: { sessions: SessionRow[] }) {
   const problematic = sessions.filter((s) => s.is_interrupt || s.is_suspicious_short);
@@ -13,11 +15,11 @@ export function SessionStatusTable({ sessions }: { sessions: SessionRow[] }) {
       </div>
       <div className="tableWrap compact">
         <table>
-          <thead><tr><th>Patient</th><th>Condition</th><th>Phase</th><th>Path</th><th>Duration</th><th>Samples</th><th>Warning</th></tr></thead>
+          <thead><tr><th>Participant</th><th>Condition</th><th>Phase</th><th>Route</th><th>Duration</th><th>Samples</th><th>Warning</th></tr></thead>
           <tbody>
             {problematic.map((s) => (
               <tr key={s.session_id}>
-                <td>{s.patient}</td><td>{s.condition_label}</td><td>{s.phase}</td><td>{s.path_id}</td>
+                <td>{participantLabel(s.patient)}</td><td>{conditionLabel(s.condition)}</td><td>{phaseLabel(s.phase, false)}</td><td>{routeLabel(s.path_id, s.route_id)}</td>
                 <td>{s.duration_s?.toFixed(1) ?? '—'}</td><td>{s.n_raw ?? '—'}</td><td>{s.warning}</td>
               </tr>
             ))}

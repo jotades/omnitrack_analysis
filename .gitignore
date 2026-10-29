@@ -6,3 +6,15 @@ node_modules/
 dist/
 .DS_Store
 .vscode/
+backend/app/trial_annotations.json
+backend/app/patient_inclusion.json
+backend/app/target_coordinates.json
+backend/app/phase_overrides.json
+backend/app/manual_discovery.json
+backend/app/task_split.json
+backend/app/observations.json
+backend/app/recording_pins.json
+backend/app/pause_noise_threshold.json
+backend/app/route_overrides.json
+backend/app/stats_exclusions.json
+backend/app/corrections_log.jsonl

@@ -1,6 +1,9 @@
 import { useState, type ReactNode } from 'react';
 import { saveActivationDistance } from '../api';
+import { useEditMode } from '../lib/editMode';
 import type { SessionPayload, SessionRow } from '../types';
+import { routeLabel } from '../lib/route';
+import { conditionLabel, participantLabel, phaseLabel } from '../lib/glossary';
 
 /** Activation distance is shown as plain text everywhere except while this
  * row is being edited — saving writes straight into the session's raw JSON
@@ -16,6 +19,7 @@ function ActivationDistanceEditor({
   const [editing, setEditing] = useState(false);
   const [minStr, setMinStr] = useState('');
   const [maxStr, setMaxStr] = useState('');
+  const editMode = useEditMode();
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,6 +32,8 @@ function ActivationDistanceEditor({
       <button
         type="button"
         className="linkButton"
+        disabled={!editMode}
+        title={editMode ? 'Change the activation distance (written into the recording file; logged and undoable)' : 'Read only: turn on edit mode to change'}
         onClick={() => {
           setMinStr(String(distanceCfg?.min_activation_distance ?? ''));
           setMaxStr(String(distanceCfg?.max_activation_distance ?? ''));
@@ -102,10 +108,10 @@ export function SessionSetupCard({ session, payload }: { session: SessionRow | n
   const targets: string[] | undefined = config?.target_ids ?? summary.target_ids;
 
   const items: Array<[string, ReactNode]> = [
-    ['Patient', session.patient],
-    ['Condition', session.condition_label || session.condition],
-    ['Path', session.path_id],
-    ['Phase', session.phase],
+    ['Participant', participantLabel(session.patient)],
+    ['Condition', conditionLabel(session.condition)],
+    ['Route', routeLabel(session.path_id, session.route_id)],
+    ['Phase', phaseLabel(session.phase)],
     ['Seeker', config?.seeker_id ?? summary.seeker_id ?? '—'],
     ['Targets', targets?.length ? targets.join(', ') : '—'],
     ['Room size', roomDims(config?.anchors) ?? '—'],

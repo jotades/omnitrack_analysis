@@ -62,11 +62,16 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 export DATA_DIR=/home/jota/Downloads/third_analysis_dataset/Pilot/pp_study
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+cd app   # start from inside app/, see the note below
+uvicorn app.main:app --app-dir .. --reload --host 127.0.0.1 --port 8020
 ```
 
-- API: <http://127.0.0.1:8000>
-- Interactive API docs (Swagger): <http://127.0.0.1:8000/docs>
+Or simply `./run_backend.sh` from `backend/`, which does the same.
+
+Why from `app/`: with `--reload`, uvicorn always watches the folder it is started from. Started from `backend/`, that includes `.venv`, and the system runs out of file watches ("OS file watch limit reached").
+
+- API: <http://127.0.0.1:8020>
+- Interactive API docs (Swagger): <http://127.0.0.1:8020/docs>
 
 ### Frontend
 

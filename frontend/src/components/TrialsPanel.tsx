@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, RefreshCw } from 'lucide-react';
-import { savePatientInclusion } from '../api';
+import { fetchStatsExclusions, savePatientInclusion } from '../api';
+import { useEditMode } from '../lib/editMode';
+import { conditionLabel, participantLabel } from '../lib/glossary';
 import type { CompareRow, PatientTrialSummary, SessionRow, TrialRow } from '../types';
 import { avgBy, fmtNum, maxBy, sumBy } from '../lib/aggregate';
 import { ConditionTrajectoriesGrid } from './ConditionTrajectoriesGrid';
@@ -43,9 +45,11 @@ function attemptChoiceKey(patient: string, condition: string, pathId: string, ph
  * (ConditionTrajectoriesGrid's own session-payload fetch) stays lazy beyond
  * that, same as before. */
 function PatientTrialSection({
-  patient, sessions, summary, sessionRows, trialRows, trialAggregate, dataLoading, onRequestTrialRows, onAnnotationSaved,
-  included, onSetIncluded, attemptChoices, onSetAttemptChoice,
+  patient, sessions, summary, sessionRows, trialRows, trialAggregate, dataLoading, onRequestTrialRows, onRefreshPatientTrialRows, onAnnotationSaved,
+  included, onSetIncluded, attemptChoices, onSetAttemptChoice, statsExclusion,
 }: {
+  /** Reason this participant is left out of the ANOVA and mixed models, if they are. */
+  statsExclusion?: string;
   patient: string;
   sessions: SessionRow[];
   summary?: PatientTrialSummary;
@@ -54,6 +58,7 @@ function PatientTrialSection({
   trialAggregate?: PatientTrialAggregate;
   dataLoading: boolean;
   onRequestTrialRows: (patients: string[]) => void;
+  onRefreshPatientTrialRows: (patient: string) => void;
   onAnnotationSaved?: (info: { condition: string; pathId: string; explorationSessionId: number | null; excludedFromStats: boolean }) => void;
   included: boolean;
   onSetIncluded: (included: boolean) => void;
@@ -62,6 +67,7 @@ function PatientTrialSection({
 }) {
   const [open, setOpen] = useState(false);
   const [selectedPhase, setSelectedPhase] = useState<Phase>('exploration');
+  const editMode = useEditMode();
 
   // Fetch this patient's trial metrics the first time their dropdown opens —
   // onRequestTrialRows is a no-op if already cached/in flight, so this is
@@ -122,7 +128,7 @@ function PatientTrialSection({
       { label: 'Valid trials', value: String(trialAggregate.validTrials) },
       { label: 'Attempts loaded', value: String(trialAggregate.attemptsLoaded) },
       { label: 'Avg overlap', value: fmtNum(trialAggregate.avgOverlap, 0, '%') },
-      { label: 'Stops total', value: String(trialAggregate.totalStops) },
+      { label: 'Pauses total', value: String(trialAggregate.totalStops) },
       { label: 'Border crossings', value: String(trialAggregate.totalBorder) },
     ] : []),
     ...(sessionSummary ? [
@@ -143,30 +149,45 @@ function PatientTrialSection({
     const patientConditions = new Set(sessions.filter((s) => s.patient === patient).map((s) => s.condition));
     return allConditions
       .filter((c) => !patientConditions.has(c))
-      .map((c) => sessions.find((s) => s.condition === c)?.condition_label ?? c);
+      .map((c) => conditionLabel(c));
   }, [sessions, patient]);
 
   return (
     <section className="card">
-      <button type="button" className="collapseHeader" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-        <ChevronDown size={18} className={`collapseChevron ${open ? 'open' : ''}`} />
-        <span className="collapseTitle">
-          <strong>{patient}</strong>
-          <small>
-            Learning vs exploration — every condition × path this patient ran
-            {summary ? ` · ${summary.lost_trials}/${summary.total_trials} trials lost` : ''}
-          </small>
-        </span>
-        {summary && summary.lost_trials > 0 ? <span className="warningBadge">{summary.lost_trials} lost</span> : null}
-        {dataLoading ? <RefreshCw size={15} className="spin" /> : null}
-      </button>
+      <div className="collapseHeaderRow">
+        <button type="button" className="collapseHeader" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+          <ChevronDown size={18} className={`collapseChevron ${open ? 'open' : ''}`} />
+          <span className="collapseTitle">
+            <strong>{participantLabel(patient)}</strong>
+            <small>
+              Learning vs exploration phase — every condition × route this participant walked
+              {summary ? ` · ${summary.lost_trials}/${summary.total_trials} trials lost` : ''}
+            </small>
+          </span>
+          {summary && summary.lost_trials > 0 ? <span className="warningBadge">{summary.lost_trials} lost</span> : null}
+          {statsExclusion ? (
+            <span className="statsExcludedBadge" title={`Left out of the ANOVA and the mixed model (data quality): ${statsExclusion}. Still shown here and in the descriptive totals.`}>
+              Not in statistics: {statsExclusion.split(':')[0]}
+            </span>
+          ) : null}
+        </button>
+        <button
+          type="button"
+          className="patientRefreshButton"
+          title={`Re-fetch ${patient}'s trial data from the backend now, without waiting to reopen this dropdown or running the app-wide Refresh index — picks up any annotation/coordinate/override edit immediately, but not a brand-new raw session file (that still needs Refresh index).`}
+          disabled={dataLoading}
+          onClick={(e) => { e.stopPropagation(); onRefreshPatientTrialRows(patient); }}
+        >
+          <RefreshCw size={15} className={dataLoading ? 'spin' : undefined} />
+        </button>
+      </div>
 
       <div className="patientHeaderExtra">
         <div className="patientHeaderControls">
           <PhaseToggle selected={selectedPhase} available={availability} onSelect={setSelectedPhase} />
-          <label className="inlineCheck" title="Whether this patient's sessions/trials count toward the General statistics totals">
-            <input type="checkbox" checked={included} onChange={(e) => onSetIncluded(e.target.checked)} />
-            Include in General statistics
+          <label className="inlineCheck" title={"Whether this participant's recordings count in the descriptive totals of General statistics (and, unless excluded for data quality, in the ANOVA)." + (editMode ? '' : ' Turn on edit mode to change.')}>
+            <input type="checkbox" checked={included} disabled={!editMode} onChange={(e) => onSetIncluded(e.target.checked)} />
+            Show in General statistics
           </label>
         </div>
         {headerTiles.length ? (
@@ -227,6 +248,9 @@ interface Props {
    * fetching this for every patient up front used to take minutes. Cheap to
    * call again: the parent skips patients it already has cached. */
   onRequestTrialRows: (patients: string[]) => void;
+  /** Manual per-patient "Refresh" button — forces a re-fetch of just this
+   * one patient's trial rows even though a cached copy already exists. */
+  onRefreshPatientTrialRows: (patient: string) => void;
   onRefreshPatientSummaries: () => void;
   inclusion: Record<string, boolean>;
   onSetInclusion: (patient: string, included: boolean) => void;
@@ -237,9 +261,11 @@ interface Props {
 }
 
 export function TrialsPanel({
-  sessions, sessionRows, allTrialRows, patientSummaries, loadingPatients, onRequestTrialRows, onRefreshPatientSummaries,
+  sessions, sessionRows, allTrialRows, patientSummaries, loadingPatients, onRequestTrialRows, onRefreshPatientTrialRows, onRefreshPatientSummaries,
   inclusion, onSetInclusion, excludedTrialOverrides, onSetTrialExcluded, attemptChoices, onSetAttemptChoice,
 }: Props) {
+  const [statsExclusions, setStatsExclusions] = useState<Record<string, string>>({});
+  useEffect(() => { fetchStatsExclusions().then(setStatsExclusions).catch(() => {}); }, []);
   // ---------------------------------------------------------------------
   // Trial overview: one collapsible "dropdown" per patient, named after the
   // patient. Opening it reveals every condition × path they ran (learning-vs-
@@ -306,13 +332,15 @@ export function TrialsPanel({
         const chosenId = attemptChoices[attemptChoiceKey(p, r.condition, r.path_id, 'exploration')];
         if (chosenId !== undefined && r.exploration_session_id === chosenId) chosenByTrial.set(key, r);
       }
-      for (const [key, row] of chosenByTrial) latestByTrial.set(key, row);
+      // A recording fixed by hand on the backend (recording_pins.json) wins over a browser pick.
+      const pinnedTrials = new Set(patientRows.filter((r) => r.exploration_pinned && !r.excluded_from_stats).map((r) => `${r.condition}|${r.path_id}`));
+      for (const [key, row] of chosenByTrial) if (!pinnedTrials.has(key)) latestByTrial.set(key, row);
       const validRows = Array.from(latestByTrial.values());
       map.set(p, {
         attemptsLoaded: patientRows.length,
         validTrials: validRows.length,
         avgOverlap: avgBy(validRows, 'overlap_pct'),
-        totalStops: sumBy(validRows, 'stop_count'),
+        totalStops: sumBy(validRows, 'exploration_pause_count'),
         totalBorder: sumBy(validRows, 'border_reached_count'),
       });
     }
@@ -325,7 +353,7 @@ export function TrialsPanel({
         <div className="cardHeader">
           <div>
             <h2>Trial overview: exploration vs. learning</h2>
-            <p>One dropdown per patient — open it to see every condition × path they ran, with the learning/exploration trajectory overlay and the aggregated trial metrics.</p>
+            <p>One dropdown per participant — open it to see every condition × route they ran, with the learning/exploration trajectory overlay and the aggregated trial metrics.</p>
           </div>
         </div>
       </section>
@@ -342,11 +370,13 @@ export function TrialsPanel({
             trialAggregate={trialAggregateByPatient.get(patient)}
             dataLoading={loadingPatients.has(patient)}
             onRequestTrialRows={onRequestTrialRows}
+            onRefreshPatientTrialRows={onRefreshPatientTrialRows}
             onAnnotationSaved={(info) => {
               onSetTrialExcluded(patient, info.condition, info.pathId, info.explorationSessionId, info.excludedFromStats);
               onRefreshPatientSummaries();
             }}
             included={inclusion[patient] !== false}
+            statsExclusion={statsExclusions[patient]}
             onSetIncluded={(v) => {
               onSetInclusion(patient, v);
               savePatientInclusion(patient, v).catch(() => {});
